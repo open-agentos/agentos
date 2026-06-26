@@ -47,7 +47,11 @@ Repository = "https://github.com/open-agentos/spec"
 "Bug Tracker" = "https://github.com/open-agentos/spec/issues"
 
 [tool.setuptools.packages.find]
+where = ["."]
 include = ["bootstrap*"]
+
+[tool.setuptools.package-data]
+"bootstrap" = ["*.yaml", "*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
