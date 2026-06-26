@@ -550,3 +550,27 @@ The `--merge` flag updates agentOS.yaml in-place, preserving your local changes
 - Read docs/agent-roles.md to understand what each App can and cannot do.
 - Read docs/plugins.md to add domain-specific automation to your project.
 - Read docs/metrics-schema.md if you want to analyse agent run data.
+
+---
+
+## Development install
+
+When working on the CLI locally, always use an editable install:
+
+```bash
+cd ~/path/to/spec
+pip install -e ".[dev]"
+```
+
+**Do not use** `pip install git+file:///path/to/spec` during development.
+That form clones from git history and silently ignores your working-tree
+changes. Use `pip install -e .` instead — changes take effect immediately
+without reinstalling.
+
+To verify your editable install is wired up:
+
+```bash
+make check-install
+# bootstrap 1.0.0 — editable install OK
+# agentOS 1.0.0
+```
