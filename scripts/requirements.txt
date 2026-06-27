@@ -1,0 +1,4 @@
+requests>=2.31
+PyYAML>=6.0
+PyJWT>=2.8
+cryptography>=41.0
