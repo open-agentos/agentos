@@ -477,8 +477,11 @@ installation does not include the repository.
 
 Fix:
 
-1. Go to github.com/settings/apps (personal) or github.com/organizations/<org>/settings/apps.
-2. Find the App (e.g., "my-agent-repo builder").
+1. Go to the installation URL printed by `agentOS setup` after each App is created.
+   For org-owned Apps the URL is:
+   `github.com/organizations/<org>/settings/apps/<app-name>/installations`
+   For personal Apps: `github.com/settings/apps/<app-name>/installations`.
+2. Find the App (e.g., "agentOS-builder").
 3. Click Permissions & events. Compare against the permission table in docs/agent-roles.md.
 4. If permissions are missing, add them and click Save.
 5. Go to Installations, find your org/personal account, click Configure, and ensure
