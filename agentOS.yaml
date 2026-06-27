@@ -277,7 +277,7 @@ board:
         - name: Watcher
           color: PURPLE
 
-    - name: Status
+    - name: Agent Status
       type: single_select
       flow: metadata
       description: "Current lifecycle status (mirrors status:* label)"

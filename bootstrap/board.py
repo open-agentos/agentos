@@ -269,10 +269,23 @@ def provision_board(
 
         # Provision fields.
         field_bindings: dict[str, Any] = {}
+        # GitHub Projects v2 creates these built-in fields on every board;
+        # attempting to create a second field with any of these names returns
+        # UNPROCESSABLE / "Name cannot have a reserved value".
+        RESERVED_FIELD_NAMES = {
+            "Status", "Title", "Assignees", "Labels",
+            "Milestone", "Repository", "Reviewers", "Linked pull requests",
+        }
         for field_def in fields_spec:
             name = field_def["name"]
             ftype = field_def["type"]
             log.info("Provisioning field '%s' (%s)…", name, ftype)
+            if name in RESERVED_FIELD_NAMES:
+                raise ValueError(
+                    f"Field name '{name}' is reserved by GitHub Projects v2 "
+                    f"(built-in fields: {', '.join(sorted(RESERVED_FIELD_NAMES))}). "
+                    f"Rename it in agentOS.yaml — e.g. 'Status' → 'Agent Status'."
+                )
             try:
                 if ftype == "single_select":
                     options = field_def.get("options", [])
