@@ -65,6 +65,7 @@ code, commits to a branch, and opens a pull request.
     checks                        write     Create check runs to report build status
     actions                       read      Read workflow run logs for context
     statuses                      write     Post commit statuses
+    workflows                     write     Push branches that modify .github/workflows/
     metadata                      read      Required by all Apps (implicit)
 
 ### What builder can do
@@ -251,8 +252,16 @@ are closed.
     ----------------------------  --------  ------------------------------------------
     organization_projects         write     Create and modify org-level Projects v2
     repository_projects           write     Create and modify repo-level Projects v2
-    issues                        read      Read issue metadata for board field mapping
+    contents                      read      Required for installation token lookup
+    issues                        read      Read issue metadata; required for token lookup
     metadata                      read      Required by all Apps (implicit)
+
+    > **Important:** `contents: read` and `issues: read` are required for the
+    > GitHub App installation token lookup (`GET /repos/{owner}/{repo}/installation`)
+    > to return 200. Without either permission the endpoint returns 404 and
+    > `scripts/github_token.py board` fails silently. This is a non-obvious GitHub
+    > Apps requirement: the App must have at least read access to the resource type
+    > it is being installed against, even when its primary function is unrelated.
 
 ### Why board is a separate App from watcher
 

@@ -228,7 +228,7 @@ The CLI opens your browser four times in sequence (or once per App if you pass
 
     builder   — builds code, opens PRs, pushes branches
                 Permissions: contents:write, pull_requests:write, issues:write,
-                             checks:write, actions:read
+                             checks:write, actions:read, workflows:write
 
     reviewer  — reads PRs, posts review comments, approves or requests changes
                 Permissions: pull_requests:write, issues:write, contents:read
@@ -237,7 +237,16 @@ The CLI opens your browser four times in sequence (or once per App if you pass
                 Permissions: issues:write, pull_requests:read, actions:read
 
     board     — manages GitHub Projects (v2) board fields and item status
-                Permissions: organization_projects:write, repository_projects:write
+                Permissions: organization_projects:write, repository_projects:write,
+                             contents:read, issues:read
+
+    > Note: agentOS-board requires contents:read and issues:read so that the
+    > GitHub App installation token lookup (GET /repos/{owner}/{repo}/installation)
+    > succeeds. Without these the token mint returns 404 and board operations fail.
+
+    > Note: agentOS-builder requires workflows:write (not just contents:write) so
+    > that git push on branches containing workflow file changes does not fail with
+    > a 403. Without this the builder falls back to REST API calls and cannot push.
 
 ### Handling the .pem private key file
 
