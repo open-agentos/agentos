@@ -540,6 +540,72 @@ def _find_item_id_for_issue(token: str, board_id: str, issue_number: int) -> str
     return ""
 
 
+
+# -- Board: add issue to project -----------------------------------------------
+
+ADD_ITEM_MUTATION = """
+mutation AddItem($projectId: ID!, $contentId: ID!) {
+  addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+    item { id }
+  }
+}
+"""
+
+
+def add_issue_to_board(github_token: str, board_id: str, target_repo: str, issue_number: int) -> None:
+    """Add an issue to a Projects v2 board by issue number.
+
+    Best-effort: logs warnings on failure, never raises into the caller.
+    """
+    try:
+        if not board_id:
+            LOGGER.warning("add_issue_to_board: BOARD_ID not set; skipping")
+            return
+        if not target_repo or "/" not in target_repo:
+            LOGGER.warning("add_issue_to_board: TARGET_REPO not set or invalid; skipping")
+            return
+
+        owner, repo_name = target_repo.split("/", 1)
+
+        req = urllib.request.Request(
+            f"{API}/repos/{owner}/{repo_name}/issues/{issue_number}",
+        )
+        req.add_header("Authorization", f"Bearer {github_token}")
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("X-GitHub-Api-Version", "2022-11-28")
+        req.add_header("User-Agent", "ops-projector")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                issue_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as exc:
+            LOGGER.warning("add_issue_to_board: could not fetch issue #%s: HTTP %s", issue_number, exc.code)
+            return
+        except Exception as exc:
+            LOGGER.warning("add_issue_to_board: could not fetch issue #%s: %s", issue_number, exc)
+            return
+
+        node_id = issue_data.get("node_id")
+        if not node_id:
+            LOGGER.warning("add_issue_to_board: no node_id on issue #%s response", issue_number)
+            return
+
+        result = _graphql(github_token, ADD_ITEM_MUTATION, {
+            "projectId": board_id,
+            "contentId": node_id,
+        })
+        item_id = (
+            (result.get("data") or {})
+            .get("addProjectV2ItemById", {})
+            .get("item", {})
+            .get("id")
+        )
+        if item_id:
+            LOGGER.info("add_issue_to_board: added issue #%s to board %s as item %s", issue_number, board_id, item_id)
+        else:
+            LOGGER.warning("add_issue_to_board: mutation returned no item id for issue #%s", issue_number)
+    except Exception as exc:
+        LOGGER.warning("add_issue_to_board: unexpected error for issue #%s: %s", issue_number, exc)
+
 # ── CLI entry point for workflow automation ───────────────────────────────────
 
 def _str_to_bool(value: str) -> bool:
@@ -605,12 +671,43 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="owner/repo of the target repository. Defaults to TARGET_REPO env.",
     )
+    parser.add_argument(
+        "--add-to-board",
+        action="store_true",
+        default=False,
+        help="Add an issue to the Projects v2 board (requires --issue).",
+    )
+    parser.add_argument(
+        "--issue",
+        dest="issue_number",
+        type=int,
+        default=None,
+        help="Issue number to add to the board (used with --add-to-board).",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(message)s",
     )
+
+    # Handle --add-to-board subcommand and exit early.
+    if args.add_to_board:
+        logging.basicConfig(
+            level=os.environ.get("LOG_LEVEL", "INFO"),
+            format="%(asctime)s %(levelname)s %(message)s",
+        )
+        if args.issue_number is None:
+            LOGGER.warning("--add-to-board requires --issue N")
+            return 1
+        _token = args.token or os.environ.get("GITHUB_TOKEN", "")
+        if not _token:
+            LOGGER.warning("--add-to-board: no GITHUB_TOKEN available; skipping")
+            return 0
+        _board_id = os.environ.get("BOARD_ID", "").strip()
+        _repo = args.repo or os.environ.get("TARGET_REPO", "")
+        add_issue_to_board(_token, _board_id, _repo, args.issue_number)
+        return 0
 
     # Resolve board_id from env or field-bindings.json
     bindings = _load_bindings()
