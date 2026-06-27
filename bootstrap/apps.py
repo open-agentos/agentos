@@ -28,6 +28,7 @@ import html
 import json
 import logging
 import sys
+import time
 import threading
 import urllib.parse
 import webbrowser
@@ -198,6 +199,7 @@ def _register_one(agent: dict[str, Any], app_name: str, org: Optional[str],
     server = HTTPServer(("localhost", port), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    time.sleep(0.5)  # give the HTTP server time to bind before opening the browser
 
     start_url = f"{base_url}/start"
     print(f"\n=== {role_id.upper()} app ===")
