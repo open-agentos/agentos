@@ -1,63 +1,59 @@
 """
-bootstrap/apps.py — GitHub App registration wizard.
+bootstrap/apps.py — GitHub App registration wizard (guided manual flow).
 
-Registers GitHub Apps via the App Manifest flow for each agent role defined
-in agentOS.yaml that has create_app: true. Role names, permission scopes, and
-event subscriptions are all driven from the spec — no hardcoded role names.
+Guides the user through creating GitHub Apps manually for each agent role
+defined in agentOS.yaml that has create_app: true. Role names, permission
+scopes, and event subscriptions are driven from the spec — no hardcoded
+role names.
 
-For each role:
-  1. Spins up a temporary local HTTP server (default http://localhost:4000).
-  2. Opens the GitHub App manifest form in the browser.
-  3. Receives the OAuth callback code after the user confirms on GitHub.
-  4. Exchanges the code for credentials via POST /app-manifests/{code}/conversions.
-  5. Writes GITHUB_APP_ID_{ROLE} and GITHUB_APP_PRIVATE_KEY_CONTENT_{ROLE}
-     (and optionally GITHUB_APP_WEBHOOK_SECRET_{ROLE}) into the .env file.
+For each role the wizard:
+  1. Prints the direct URL to github.com/organizations/{org}/settings/apps/new
+     (or the personal-account equivalent).
+  2. Prints a table of exact settings to fill in (name, permissions, events).
+  3. Prompts the user to paste their new App ID and the path to the downloaded
+     .pem private-key file.
+  4. Calls write_credentials() to store {ROLE}_APP_ID and {ROLE}_PRIVATE_KEY
+     (inline PEM with escaped newlines) in the .env file.
+
+This flow works without a browser automation layer, local HTTP server, or
+OAuth callback — making it reliable across headless environments, CI runners,
+and remote SSH sessions.
 
 Public API:
-  register_apps(spec, env_file, org=None, port=4000, open_browser=True, roles=None)
+  register_apps(spec, env_file, org=None, roles=None, app_name_prefix="agentOS",
+                prompt_fn=None) -> dict[str, dict]
   write_credentials(role, creds, env_file)
 
-Requires: requests
-    uv run --with requests python3 -m bootstrap.apps
+Requires: requests (only for the --verify flag in the CLI entry point)
 """
 
 from __future__ import annotations
 
 import argparse
-import html
-import json
 import logging
 import sys
-import time
-import threading
-import urllib.parse
-import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import requests
 
 log = logging.getLogger(__name__)
 
-GITHUB_API = "https://api.github.com"
+GITHUB_APP_SETTINGS_URL = "https://github.com/settings/apps/new"
+GITHUB_ORG_APP_SETTINGS_URL = "https://github.com/organizations/{org}/settings/apps/new"
 
-# Map spec permission key names to GitHub App manifest permission keys.
-# The spec uses snake_case; GitHub's manifest API uses snake_case too —
-# but "organization_projects" must be listed as "organization_projects".
-_PERM_KEY_MAP = {
-    "contents": "contents",
-    "issues": "issues",
-    "pull_requests": "pull_requests",
-    "metadata": "metadata",
-    "workflows": "workflows",
-    "checks": "checks",
-    "organization_projects": "organization_projects",
+# Map spec permission key names to GitHub's display names (for the printed table).
+_PERM_DISPLAY: dict[str, str] = {
+    "contents": "Repository contents",
+    "issues": "Issues",
+    "pull_requests": "Pull requests",
+    "metadata": "Metadata",
+    "workflows": "Actions workflows",
+    "checks": "Checks",
+    "organization_projects": "Organization projects",
 }
 
 # Which GitHub webhook events each role should subscribe to.
-# Driven by the routing triggers in the spec, but event subscriptions are
-# a GitHub concept not directly expressed in agentOS.yaml.
 _DEFAULT_ROLE_EVENTS: dict[str, list[str]] = {
     "builder": ["issues", "pull_request"],
     "reviewer": ["pull_request", "pull_request_review"],
@@ -69,172 +65,8 @@ _DEFAULT_ROLE_EVENTS: dict[str, list[str]] = {
 
 
 # ---------------------------------------------------------------------------
-# Manifest construction
+# Credential writing
 # ---------------------------------------------------------------------------
-
-def _permissions_for_role(agent: dict[str, Any]) -> dict[str, str]:
-    """Build a GitHub manifest permissions dict from an agent spec entry."""
-    raw = agent.get("permissions", {})
-    result: dict[str, str] = {}
-    for key, value in raw.items():
-        mapped = _PERM_KEY_MAP.get(key, key)
-        result[mapped] = value  # type: ignore[assignment]  # mapped is always str
-    return result
-
-
-def build_manifest(agent: dict[str, Any], app_name: str, base_url: str) -> dict:
-    """Construct a GitHub App manifest for the given agent spec entry."""
-    role_id = agent["id"]
-    permissions = _permissions_for_role(agent)
-    events = _DEFAULT_ROLE_EVENTS.get(role_id, ["issues"])
-    import os
-    app_url = os.environ.get(
-        "AGENTOS_APP_URL", "https://github.com/open-agentos/spec"
-    )
-    if not app_url.startswith("https://"):
-        raise ValueError(
-            f"AGENTOS_APP_URL must be an https:// URL (got {app_url!r}). "
-            "GitHub rejects http:// in the App manifest url field."
-        )
-    return {
-        "name": app_name,
-        "url": app_url,
-        "hook_attributes": {"active": False},
-        "redirect_url": f"{base_url}/callback",
-        "public": False,
-        "default_permissions": permissions,
-        "default_events": events,
-    }
-
-
-# ---------------------------------------------------------------------------
-# HTTP server for manifest OAuth flow
-# ---------------------------------------------------------------------------
-
-def _manifest_form_page(action_url: str, manifest: dict) -> bytes:
-    manifest_json = html.escape(json.dumps(manifest))
-    app_name = html.escape(manifest["name"])
-    return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Registering {app_name}…</title></head>
-<body style="font-family:system-ui;margin:3rem">
-  <h2>Creating GitHub App: {app_name}</h2>
-  <p>Submitting manifest to GitHub. If you are not redirected automatically,
-     click the button below.</p>
-  <form id="f" action="{html.escape(action_url)}" method="post">
-    <input type="hidden" name="manifest" value="{manifest_json}">
-    <button type="submit">Continue to GitHub →</button>
-  </form>
-  <script>document.getElementById('f').submit();</script>
-</body></html>""".encode("utf-8")
-
-
-def _success_page(app_slug: str) -> bytes:
-    return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>App created</title></head>
-<body style="font-family:system-ui;margin:3rem">
-  <h2>✓ GitHub App created: {html.escape(app_slug)}</h2>
-  <p>Credentials written to your .env file. You can close this tab.</p>
-</body></html>""".encode("utf-8")
-
-
-class _CallbackState:
-    code: Optional[str] = None
-    error: Optional[str] = None
-    done = threading.Event()
-
-
-def _make_handler(manifest: dict, action_url: str, state: _CallbackState):
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, fmt, *args):  # silence default stderr log
-            # Signature matches BaseHTTPRequestHandler.log_message(format, *args)
-            return
-
-        def do_GET(self):  # noqa: N802
-            parsed = urllib.parse.urlparse(self.path)
-            if parsed.path in ("/", "/start"):
-                body = _manifest_form_page(action_url, manifest)
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            if parsed.path == "/callback":
-                params = urllib.parse.parse_qs(parsed.query)
-                code = params.get("code", [None])[0]
-                if code:
-                    state.code = code
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.end_headers()
-                    self.wfile.write(_success_page(manifest["name"]))
-                else:
-                    state.error = "no code in callback"
-                    self.send_response(400)
-                    self.end_headers()
-                state.done.set()
-                return
-            self.send_response(404)
-            self.end_headers()
-    return Handler
-
-
-# ---------------------------------------------------------------------------
-# Registration + credential writing
-# ---------------------------------------------------------------------------
-
-def _register_one(agent: dict[str, Any], app_name: str, org: Optional[str],
-                  port: int, open_browser: bool) -> dict:
-    """Run the manifest OAuth flow for one agent role. Returns credential dict."""
-    base_url = f"http://localhost:{port}"
-    manifest = build_manifest(agent, app_name, base_url)
-    role_id = agent["id"]
-
-    if org:
-        action_url = f"https://github.com/organizations/{org}/settings/apps/new?state=agentOS-{role_id}"
-    else:
-        action_url = f"https://github.com/settings/apps/new?state=agentOS-{role_id}"
-
-    state = _CallbackState()
-    handler = _make_handler(manifest, action_url, state)
-    server = HTTPServer(("localhost", port), handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    time.sleep(0.5)  # give the HTTP server time to bind before opening the browser
-
-    start_url = f"{base_url}/start"
-    print(f"\n=== {role_id.upper()} app ===")
-    print(f"Open this URL to register '{app_name}':\n  {start_url}")
-    if open_browser:
-        try:
-            webbrowser.open(start_url)
-        except Exception:
-            pass
-
-    print("Waiting for GitHub callback (Ctrl-C to abort)…")
-    state.done.wait()
-    server.shutdown()
-
-    if state.error or not state.code:
-        raise RuntimeError(f"Manifest callback failed: {state.error or 'no code received'}")
-
-    resp = requests.post(
-        f"https://api.github.com/app-manifests/{state.code}/conversions",
-        headers={
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return {
-        "id": str(data["id"]),
-        "slug": data.get("slug", app_name),
-        "pem": data["pem"],
-        "webhook_secret": data.get("webhook_secret", ""),
-        "html_url": data.get("html_url", ""),
-    }
-
 
 def write_credentials(role: str, creds: dict, env_file: Path) -> None:
     """Write/refresh role credentials in env_file.
@@ -273,7 +105,7 @@ def write_credentials(role: str, creds: dict, env_file: Path) -> None:
 
     if out and out[-1].strip():
         out.append("")
-    out.append(f"# --- {creds['slug']} ({role}) — auto-written by agentOS setup ---")
+    out.append(f"# --- {creds.get('slug', role)} ({role}) — auto-written by agentOS setup ---")
     for key, value in new_entries.items():
         if key not in seen:
             out.append(f"{key}={value}")
@@ -284,6 +116,90 @@ def write_credentials(role: str, creds: dict, env_file: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Guided manual flow
+# ---------------------------------------------------------------------------
+
+def _permissions_table(agent: dict[str, Any]) -> str:
+    """Return a formatted permissions table for the printed instructions."""
+    raw = agent.get("permissions", {})
+    lines = []
+    for key, value in raw.items():
+        display = _PERM_DISPLAY.get(key, key)
+        lines.append(f"    {display:<35} {value}")
+    return "\n".join(lines) if lines else "    (none)"
+
+
+def _print_app_instructions(
+    agent: dict[str, Any],
+    app_name: str,
+    org: Optional[str],
+) -> None:
+    """Print the settings the user needs to fill in on GitHub's form."""
+    role_id = agent["id"]
+    events = _DEFAULT_ROLE_EVENTS.get(role_id, ["issues"])
+
+    if org:
+        settings_url = GITHUB_ORG_APP_SETTINGS_URL.format(org=org)
+    else:
+        settings_url = GITHUB_APP_SETTINGS_URL
+
+    print(f"\n{'='*60}")
+    print(f"  App {role_id.upper()}")
+    print(f"{'='*60}")
+    print(f"\n1. Open this URL in your browser:\n")
+    print(f"     {settings_url}\n")
+    print(f"2. Fill in the form with these settings:\n")
+    print(f"   GitHub App name:  {app_name}")
+    print(f"   Homepage URL:     https://github.com/open-agentos/spec")
+    print(f"   Webhooks:         ☐ Active  (uncheck — webhooks not used)")
+    print(f"\n   Permissions:")
+    print(_permissions_table(agent))
+    print(f"\n   Subscribe to events (optional / informational):")
+    for ev in events:
+        print(f"    • {ev}")
+    print(f"\n   Where can this GitHub App be installed?")
+    print(f"    ● Only on this account")
+    print(f"\n3. Click 'Create GitHub App'.")
+    print(f"\n4. On the App page that opens, note the App ID shown near the top.")
+    print(f"\n5. Scroll down to 'Private keys' and click 'Generate a private key'.")
+    print(f"   A .pem file will download to your machine.\n")
+
+
+def _prompt_credentials(
+    role: str,
+    app_name: str,
+    prompt_fn: Callable[[str], str],
+) -> dict:
+    """Prompt the user for App ID and PEM file path; return a creds dict."""
+    print(f"Enter credentials for '{app_name}':")
+
+    while True:
+        app_id = prompt_fn(f"  App ID (numbers only): ").strip()
+        if app_id.isdigit():
+            break
+        print("  ✗ App ID must be numeric — check the App page and try again.")
+
+    while True:
+        pem_path_str = prompt_fn(f"  Path to downloaded .pem file: ").strip()
+        pem_path = Path(pem_path_str).expanduser()
+        if pem_path.exists():
+            pem_content = pem_path.read_text(encoding="utf-8").strip()
+            if "BEGIN RSA PRIVATE KEY" in pem_content or "BEGIN PRIVATE KEY" in pem_content:
+                break
+            print(f"  ✗ File does not look like a PEM private key — try again.")
+        else:
+            print(f"  ✗ File not found: {pem_path} — try again.")
+
+    return {
+        "id": app_id,
+        "slug": app_name,
+        "pem": pem_content + "\n",
+        "webhook_secret": "",
+        "html_url": f"https://github.com/apps/{app_name}",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public orchestration function
 # ---------------------------------------------------------------------------
 
@@ -291,25 +207,32 @@ def register_apps(
     spec: dict[str, Any],
     env_file: Path,
     org: Optional[str] = None,
-    port: int = 4000,
-    open_browser: bool = True,
     roles: Optional[list[str]] = None,
     app_name_prefix: str = "agentOS",
+    prompt_fn: Optional[Callable[[str], str]] = None,
+    # Legacy keyword args accepted but ignored (port, open_browser removed)
+    **_kwargs: Any,
 ) -> dict[str, dict]:
-    """Register GitHub Apps for all create_app:true roles in the spec.
+    """Guided manual GitHub App registration for all create_app:true roles.
+
+    Prints step-by-step instructions for each role and prompts the user for
+    the App ID and private key path. Writes credentials to env_file.
 
     Args:
         spec:             Parsed agentOS.yaml dict.
         env_file:         Path to write credentials to.
         org:              GitHub org name (None = personal account).
-        port:             Local callback port.
-        open_browser:     Auto-open browser for each registration.
         roles:            Limit to these role IDs. None = all create_app:true roles.
         app_name_prefix:  Prefix for app names (e.g. "agentOS" -> "agentOS-builder").
+        prompt_fn:        Callable used to prompt the user. Defaults to input().
+                          Override in tests to avoid interactive prompts.
 
     Returns:
         Dict of {role_id: credentials_dict} for all successfully registered roles.
     """
+    if prompt_fn is None:
+        prompt_fn = input
+
     agents = spec.get("agents", [])
     to_register = [
         a for a in agents
@@ -321,24 +244,44 @@ def register_apps(
         log.warning("No agents with create_app:true found in spec.")
         return {}
 
-    print(f"GitHub App registration wizard — {len(to_register)} role(s) to register")
-    print(f"  target: {'org ' + org if org else 'personal account'}")
+    target_desc = f"org: {org}" if org else "personal account"
+    print(f"\nagentOS setup — {len(to_register)} GitHub App(s) to create")
+    print(f"  target:   {target_desc}")
     print(f"  env file: {env_file}")
+    print(
+        "\nFor each role you will:\n"
+        "  • Open a GitHub URL and fill in a short form\n"
+        "  • Paste the App ID back here\n"
+        "  • Provide the path to the downloaded .pem private key\n"
+        "\nPress Ctrl-C at any time to abort."
+    )
 
     results: dict[str, dict] = {}
     for agent in to_register:
         role_id = agent["id"]
         app_name = f"{app_name_prefix}-{role_id}"
+
+        _print_app_instructions(agent, app_name, org)
+
         try:
-            creds = _register_one(agent, app_name, org, port, open_browser)
+            creds = _prompt_credentials(role_id, app_name, prompt_fn)
+        except (KeyboardInterrupt, EOFError):
+            print("\nAborted.", file=sys.stderr)
+            break
         except Exception as exc:
-            log.error("Failed to register '%s': %s", role_id, exc)
-            print(f"  ERROR: {role_id} registration failed — {exc}", file=sys.stderr)
+            log.error("Failed to collect credentials for '%s': %s", role_id, exc)
+            print(f"  ERROR: {role_id} — {exc}", file=sys.stderr)
             continue
 
         write_credentials(role_id, creds, env_file)
         print(f"  ✓ {role_id} app registered — App ID: {creds['id']}")
-        print(f"  IMPORTANT: install the app on your target repo: {creds['html_url']}")
+        role_u = role_id.upper()
+        install_url = (
+            f"https://github.com/organizations/{org}/settings/apps/{app_name}/installations"
+            if org
+            else f"https://github.com/settings/apps/{app_name}/installations"
+        )
+        print(f"  IMPORTANT: install the app on your target repo:\n    {install_url}")
         results[role_id] = creds
 
     return results
@@ -351,15 +294,17 @@ def register_apps(
 if __name__ == "__main__":
     import yaml
 
-    parser = argparse.ArgumentParser(description="Register GitHub Apps via manifest flow.")
+    parser = argparse.ArgumentParser(
+        description="Register GitHub Apps via guided manual flow."
+    )
     parser.add_argument("--spec", default="agentOS.yaml", help="Path to agentOS.yaml")
     parser.add_argument("--env", default=".env", help="Path to .env file")
     parser.add_argument("--org", help="GitHub org (default: personal account)")
     parser.add_argument("--prefix", default="agentOS", help="App name prefix")
-    parser.add_argument("--port", type=int, default=4000)
-    parser.add_argument("--no-browser", action="store_true")
-    parser.add_argument("--role", action="append", dest="roles",
-                        help="Register only this role (repeatable)")
+    parser.add_argument(
+        "--role", action="append", dest="roles",
+        help="Register only this role (repeatable)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
@@ -376,8 +321,6 @@ if __name__ == "__main__":
         spec=spec_data,
         env_file=Path(args.env),
         org=args.org,
-        port=args.port,
-        open_browser=not args.no_browser,
         roles=args.roles,
         app_name_prefix=args.prefix,
     )

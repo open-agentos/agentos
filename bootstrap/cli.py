@@ -159,7 +159,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_setup(args: argparse.Namespace) -> int:
-    """Interactive GitHub App registration wizard."""
+    """Guided GitHub App registration wizard (no browser automation required)."""
     spec = _load_spec(Path(args.spec))
     _load_env(Path(args.env))
 
@@ -168,8 +168,6 @@ def cmd_setup(args: argparse.Namespace) -> int:
         spec=spec,
         env_file=Path(args.env),
         org=args.org,
-        port=args.port,
-        open_browser=not args.no_browser,
         roles=args.role or None,
         app_name_prefix=args.prefix,
     )
@@ -179,10 +177,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         return 1
 
     print(f"\nRegistered {len(results)} app(s).")
-    print("Next steps:")
-    for role_id, creds in results.items():
-        print(f"  1. Install the {role_id} app on your repo: {creds['html_url']}")
-    print(f"  2. Run:  agentOS apply --repo {args.repo}")
+    print(f"Next step:  agentOS apply --repo {args.repo}")
     return 0
 
 
@@ -315,12 +310,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Overwrite existing agentOS.yaml")
 
     # setup
-    p_setup = sub.add_parser("setup", help="Register GitHub Apps (interactive wizard)")
+    p_setup = sub.add_parser("setup", help="Register GitHub Apps (guided manual wizard)")
     p_setup.add_argument("--repo", required=True, metavar="OWNER/REPO")
     p_setup.add_argument("--org", help="GitHub org for app creation")
     p_setup.add_argument("--prefix", default="agentOS", help="App name prefix")
-    p_setup.add_argument("--port", type=int, default=4000)
-    p_setup.add_argument("--no-browser", action="store_true")
     p_setup.add_argument("--role", action="append",
                          help="Register only this role (repeatable)")
 
