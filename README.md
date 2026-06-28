@@ -1,105 +1,93 @@
-# GitHub AgentOS Spec
+# Open AgentOS
 
-**A portable, versioned specification for label-driven multi-agent orchestration on GitHub.**
+**AI Agent Command and Control Center**
 
-AgentOS turns a GitHub repository into a self-operating development system. Issues move through a
+Open AgentOS turns a GitHub repository into an AI operating system. Issues move through a
 status-label state machine. Each transition fires a GitHub Actions workflow that routes work to the
-right AI agent. Agents act, post receipts, and hand off — all through standard GitHub primitives.
+right AI agent. Agents act, post receipts, and hand off — the full lifecycle of an agent's work —
+from labelled issue to merged PR — all through standard GitHub primitives.
 
-You import this spec into your repo and a bootstrap CLI provisions everything: labels, a Projects v2
-command-center board, GitHub App identities, and workflow files. From zero to a working agent loop
-in under 30 minutes.
+Bring your own agent: the runner — Claude, Codex, Hermes, your own script — is
+a config value, and Open AgentOS is the protocol around it. Every run leaves a
+cost-and-outcome record. Every role has its own least-privilege identity.
+
+---
+
+## The loop
+
+```
+issue labelled status:todo
+        │
+        ▼
+  orchestrator fires ── routes by label ──▶ builder agent
+        │                                        │
+        │                                   opens PR, sets status:in-review
+        ▼                                        │
+   reviewer agent ◀───────────────────────────── ┘
+        │
+   approves / requests changes
+        ▼
+   PR merges ──▶ watcher settles the board
+```
+
+## Every run is accounted for
+
+Each agent invocation leaves a structured record.
+
+```json
+{
+  "event": "run",
+  "role": "builder",
+  "issue": 42,
+  "model": "claude-sonnet-4-6",
+  "turns": 11,
+  "max_turns_hit": false,
+  "total_cost_usd": 0.58,
+  "clean_exit": "clean",
+  "outcome": "merged"
+}
+```
+
+## Built on least privilege
+
+Each role gets its own GitHub App identity. The reviewer App can't push code — so a reviewer cannot approve its own work. The board App can't touch source. Every action an agent takes is attributable to a named identity, by design rather than by policy.
 
 ---
 
 ## Quickstart
 
-```sh
-# 1. Install the CLI
-pip install agentOS-cli
+A first run needs one agent. The full review-and-settle loop comes after.
 
-# 2. Initialise a spec file in your project
+```bash
+# Install, and pull the spec into a repo
+uv tool install agentOS-cli
+cd my-agent-repo
 agentOS init --from github:open-agentos/spec@v1.0
 
-# 3. Register GitHub Apps (interactive wizard — opens browser once per role)
-agentOS setup --repo owner/my-repo
+# Create the one App a first run needs (opens the browser once)
+agentOS setup --repo my-org/my-agent-repo --apps builder
 
-# 4. Provision labels, board, and workflows
-agentOS apply --repo owner/my-repo
-
-# 5. Verify everything is wired up
-agentOS verify --repo owner/my-repo
+# Provision labels, board, and workflows; commit them; confirm
+agentOS apply  --repo my-org/my-agent-repo --commit
+agentOS verify --repo my-org/my-agent-repo
 ```
 
-## How it works
+Then label an issue `type:feature` + `status:todo` and watch the PR open. Full walkthrough: **[Getting Started](./docs/getting-started.md)**.
 
-```
-Issue labeled status:todo
-        |
-        v
-agent-orchestrator.yml fires
-        |
-        v
-Dispatches: AGENT_ROLE=builder ISSUE_NUMBER=42 GITHUB_TOKEN=...
-        |
-        v
-Your runner command executes (hermes / claude / codex / custom)
-        |
-        v
-Agent opens PR, labels issue status:in-review
-        |
-        v
-Reviewer agent fires, approves or requests changes
-        |
-        v
-PR merged -> settlement workflow finalises board
-```
+---
 
-The spec defines the protocol (labels, routing, board fields, metrics schema). Your agent runtime
-is a configuration value — bring Hermes, Claude Code, Codex, or your own script.
+## Docs
 
-## What is provisioned
+- [Getting Started](./docs/getting-started.md) — first run in ~30 minutes
+- [Agent Roles](./docs/agent-roles.md) — identities, permissions, the runner interface
+- [Label Model](./docs/label-model.md) — the state machine behind the labels
+- [Metrics Schema](./docs/metrics-schema.md) — the run-record corpus
+- [Specification](./SPEC.md) — the normative reference
 
-- **25 labels** across 5 axes (status, agent, type, review, source)
-- **Projects v2 board** with 10 fields (metadata + telemetry, including 5 default model options)
-- **4 GitHub Apps** with least-privilege permission sets (builder, reviewer, watcher, board)
-- **4 GHA workflows** (orchestrator, settlement, failure detection, receipt poster)
-- **Agent scaffold** (AGENT.md templates for each role)
-- **JSONL metrics schema** (run-record v6, cost accounting, settlement events)
+## Reference implementation
 
-## Plugins
-
-Core is intentionally minimal. Project-specific behaviour lives in plugins:
-
-```yaml
-plugins:
-  - name: three-questions
-    source: github:open-agentos/spec//plugins/three-questions@v1.0
-```
-
-The `three-questions` reference plugin ships with this repo and demonstrates the plugin interface.
-
-## Documentation
-
-- [Getting Started](docs/getting-started.md) — full 30-minute walkthrough
-- [Label Model](docs/label-model.md) — all axes, routing table, state machine
-- [Agent Roles](docs/agent-roles.md) — permissions, runtime interface, branch convention
-- [Projects v2 Integration](docs/projects-v2-integration.md) — board fields, fingerprinting
-- [Metrics Schema](docs/metrics-schema.md) — JSONL v6 run-record reference
-- [Plugin Authoring](docs/plugins.md) — how to build and publish a plugin
-- [Specification](SPEC.md) — the full normative document
-
-## Versioning
-
-This spec uses semantic versioning. Breaking changes (label renames, field removals) bump the major
-version and ship a `MIGRATION.md`. See [CHANGELOG.md](CHANGELOG.md).
-
-## Reference Implementation
-
-[3qs-ops](https://github.com/mattmcalister/3qs-ops) is the production system that this spec was
-extracted from. It runs the [3Qs](https://github.com/mattmcalister/3qs-repo) product and has
-processed 140+ agent runs to date.
+[3qs-ops](https://github.com/mattmcalister/3qs-ops) is the production system agentOS was extracted from. 140+ agent runs and counting.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](./LICENSE).
