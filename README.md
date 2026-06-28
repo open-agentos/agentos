@@ -84,10 +84,6 @@ Then label an issue `type:feature` + `status:todo` and watch the PR open. Full w
 - [Metrics Schema](./docs/metrics-schema.md) — the run-record corpus
 - [Specification](./SPEC.md) — the normative reference
 
-## Reference implementation
-
-[3qs-ops](https://github.com/mattmcalister/3qs-ops) is the production system agentOS was extracted from. 140+ agent runs and counting.
-
 ## License
 
 MIT — see [LICENSE](./LICENSE).
