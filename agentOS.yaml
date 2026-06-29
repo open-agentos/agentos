@@ -199,11 +199,6 @@ labels:
         description: "Cannot proceed without human intervention"
         routes_to: null           # Human resolves
 
-      - name: planning
-        color: "bfd4f2"
-        description: "Needs decomposition before builder can start"
-        routes_to: null           # planner role handles this if enabled
-
       - name: plan
         color: "c5def5"
         description: "Expand this issue into a plan (planner entry point)"
