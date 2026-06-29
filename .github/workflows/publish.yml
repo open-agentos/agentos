@@ -1,21 +1,142 @@
-name: Publish to PyPI
+# publish.yml — Release and publish the open-agentos package.
+#
+# Two jobs:
+#
+# 1. release — runs on every push to main.
+#    Reads the version from pyproject.toml. If a tag v{version} does not yet
+#    exist, creates a GitHub release + tag. This ensures the tag is available
+#    before PyPI publish and before `agentOS apply --upgrade` resolves it.
+#
+# 2. publish — runs when a v* tag is pushed (created by the release job or
+#    manually). Builds the sdist + wheel and publishes to PyPI using OIDC
+#    trusted publishing (no stored API key required).
+#
+# PyPI trusted-publisher setup (one-time):
+#   1. On PyPI: Add a new trusted publisher for open-agentos
+#      owner=open-agentos  repo=spec  workflow=publish.yml  env=pypi
+#   2. No secret is needed in the repo — OIDC handles auth.
+
+name: Release & Publish
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
 jobs:
-  publish:
+  # ---------------------------------------------------------------------------
+  # release — create a GitHub release + tag when the version in pyproject.toml
+  # is bumped on main. Idempotent: does nothing if the tag already exists.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create GitHub release
     runs-on: ubuntu-latest
+    # Only run on branch pushes, not on tag pushes (tags already carry a release).
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write   # needed to create releases and tags
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history so we can check existing tags
+
+      - name: Read version from pyproject.toml
+        id: version
+        run: |
+          VERSION=$(python3 -c "
+          import re, pathlib
+          txt = pathlib.Path('pyproject.toml').read_text()
+          m = re.search(r'^version\s*=\s*\"([^\"]+)\"', txt, re.MULTILINE)
+          print(m.group(1))
+          ")
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "TAG=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether tag already exists
+        id: tag_check
+        run: |
+          TAG="${{ steps.version.outputs.TAG }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "EXISTS=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG already exists — skipping release creation."
+          else
+            echo "EXISTS=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG does not exist — will create release."
+          fi
+
+      - name: Create GitHub release
+        if: steps.tag_check.outputs.EXISTS == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.TAG }}"
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          # Extract the matching changelog section (everything between this
+          # version heading and the next) for the release notes.
+          NOTES=$(python3 - <<'PYEOF'
+          import re, pathlib
+          txt = pathlib.Path('CHANGELOG.md').read_text()
+          # Match the block starting at the first ## [VERSION] line.
+          version = "${{ steps.version.outputs.VERSION }}"
+          pattern = rf'## \[{re.escape(version)}\][^\n]*\n(.*?)(?=\n## \[|\Z)'
+          m = re.search(pattern, txt, re.DOTALL)
+          print(m.group(1).strip() if m else f"Release {version}")
+          PYEOF
+          )
+          gh release create "$TAG" \
+            --title "agentOS $VERSION" \
+            --notes "$NOTES" \
+            --target main
+
+  # ---------------------------------------------------------------------------
+  # publish — build and upload to PyPI when a v* tag is pushed.
+  # Runs after `release` creates the tag, or when a tag is pushed manually.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    # Run on tag pushes only (not branch pushes — the release job handles those).
+    if: startsWith(github.ref, 'refs/tags/v')
     environment: pypi
     permissions:
-      id-token: write
+      id-token: write   # required for OIDC trusted publishing
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install build
-      - run: python -m build
-      - uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Verify package name
+        # Guard against accidentally publishing the wrong package name.
+        run: |
+          python3 - <<'PYEOF'
+          import zipfile, glob, sys
+          wheels = glob.glob("dist/*.whl")
+          if not wheels:
+              print("ERROR: no wheel found in dist/", file=sys.stderr)
+              sys.exit(1)
+          name = zipfile.Path(wheels[0]).name.split("-")[0]
+          expected = "open_agentos"
+          if name != expected:
+              print(f"ERROR: wheel name is {name!r}, expected {expected!r}", file=sys.stderr)
+              sys.exit(1)
+          print(f"OK: wheel name is {name!r}")
+          PYEOF
+
+      - name: Publish to PyPI (OIDC)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No password/token needed — OIDC trusted publisher handles auth.
