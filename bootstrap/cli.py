@@ -196,11 +196,52 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# upgrade (invoked via `agentOS apply --upgrade`)
+# ---------------------------------------------------------------------------
+
+def cmd_upgrade(args: argparse.Namespace) -> int:
+    """Upgrade a provisioned repo to a newer spec version.
+
+    Called automatically by cmd_apply when --upgrade is set.
+    """
+    _load_env(Path(args.env))
+
+    from bootstrap.upgrade import UpgradeOptions, run_upgrade
+
+    target_dir = Path(args.target_dir) if getattr(args, "target_dir", None) else Path.cwd()
+    templates_dir_arg = getattr(args, "templates_dir", None)
+
+    # Load current spec from the target directory (or from --spec override).
+    spec_path = target_dir / "agentOS.yaml"
+    if not spec_path.exists():
+        spec_path = Path(args.spec)
+    spec = _load_spec(spec_path)
+
+    opts = UpgradeOptions(
+        target_dir=target_dir,
+        templates_dir=Path(templates_dir_arg) if templates_dir_arg else None,
+        to_version=getattr(args, "upgrade_to", None) or None,
+        dry_run=getattr(args, "dry_run", False),
+        repo=getattr(args, "repo", None),
+        token=_resolve_token("GITHUB_TOKEN"),
+        spec=spec,
+    )
+
+    result = run_upgrade(opts)
+    result.print_summary()
+    return 0 if result.ok else 1
+
+
+# ---------------------------------------------------------------------------
 # apply
 # ---------------------------------------------------------------------------
 
 def cmd_apply(args: argparse.Namespace) -> int:
     """Provision labels, board, and workflows to a target repo."""
+    # Route --upgrade to the upgrade command handler.
+    if getattr(args, "upgrade", False):
+        return cmd_upgrade(args)
+
     spec = _load_spec(Path(args.spec))
     _load_env(Path(args.env))
 
@@ -347,6 +388,22 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Show what would happen without making changes")
     p_apply.add_argument("--reset", action="store_true",
                          help="Reset state file and re-run all steps from scratch")
+    # Upgrade flags — active when --upgrade is set.
+    p_apply.add_argument(
+        "--upgrade", action="store_true",
+        help=(
+            "Upgrade a provisioned repo from its current spec version to a newer one. "
+            "Only modifies content inside <!-- agentOS:managed:begin/end --> markers."
+        ),
+    )
+    p_apply.add_argument(
+        "--to", dest="upgrade_to", metavar="VERSION",
+        help="Target spec version for --upgrade (default: latest GitHub release tag)",
+    )
+    p_apply.add_argument(
+        "--templates-dir", dest="templates_dir", metavar="PATH",
+        help="Local templates/ directory to use for --upgrade (default: bundled or fetched)",
+    )
 
     # verify
     p_verify = sub.add_parser("verify", help="Check repo matches agentOS.yaml")
