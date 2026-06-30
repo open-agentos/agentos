@@ -62,6 +62,68 @@ def _require_token(env_var: str, hint: str) -> str:
     return token
 
 
+def _warn_if_venv_shadowed() -> None:
+    """Warn when an active venv isn't the one this `agentOS` is running from.
+
+    Activating a venv prepends its bin/ to PATH but does not remove earlier
+    entries. If a prior `pip install --user` or `pipx install` placed an
+    `agentOS` earlier on PATH (e.g. ~/.local/bin), the shell can resolve
+    `agentOS` to that install even with a venv "active" — silently running
+    different code with no error. This produces confusing symptoms (e.g. a
+    subcommand "missing" from --help) that look like install or git-state
+    bugs but are actually just PATH shadowing.
+
+    This check is best-effort and non-fatal: it only fires when VIRTUAL_ENV
+    is set and sys.prefix doesn't match it, which is a reliable signal that
+    the running interpreter is not the active venv's interpreter.
+    """
+    venv = os.environ.get("VIRTUAL_ENV")
+    if not venv:
+        return
+    try:
+        venv_resolved = str(Path(venv).resolve())
+        prefix_resolved = str(Path(sys.prefix).resolve())
+    except OSError:
+        return
+    if prefix_resolved == venv_resolved:
+        return
+    venv_bin = Path(venv) / "bin" / "agentOS"
+    print(
+        f"warning: a virtualenv is active ({venv}) but this agentOS is "
+        f"running from {sys.prefix}, not the venv.",
+        file=sys.stderr,
+    )
+    print(
+        f"  Run `{venv_bin}` explicitly, or remove the shadowing install "
+        "earlier on PATH.",
+        file=sys.stderr,
+    )
+
+
+class _VersionWithPathAction(argparse.Action):
+    """Like the built-in 'version' action, but also prints the resolved
+    path of the running agentOS binary, so a PATH-shadowed install (e.g.
+    an old `pip install --user` ahead of an active venv) is visible at a
+    glance instead of silently returning the wrong version/subcommands.
+    """
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS,
+                 default=argparse.SUPPRESS, help="show program's version number and exit"):
+        super().__init__(
+            option_strings=option_strings, dest=dest, default=default,
+            nargs=0, help=help,
+        )
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        entry_point = sys.argv[0] if sys.argv else sys.executable
+        try:
+            resolved = str(Path(entry_point).resolve())
+        except OSError:
+            resolved = entry_point
+        print(f"agentOS {__version__} ({resolved})")
+        parser.exit()
+
+
 # ---------------------------------------------------------------------------
 # init
 # ---------------------------------------------------------------------------
@@ -403,8 +465,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="GitHub AgentOS — provision label-driven multi-agent orchestration.",
     )
     parser.add_argument(
-        "--version", action="version",
-        version=f"agentOS {__version__}",
+        "--version", action=_VersionWithPathAction,
     )
     parser.add_argument("--spec", default="agentOS.yaml",
                         help="Path to agentOS.yaml (default: ./agentOS.yaml)")
@@ -510,6 +571,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    _warn_if_venv_shadowed()
+
     parser = build_parser()
     args = parser.parse_args()
 
