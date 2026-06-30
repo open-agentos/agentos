@@ -79,7 +79,7 @@ _SPEC_REPO = "open-agentos/spec"
 # Each entry: (path_glob_relative_to_target, template_path_relative_to_spec_templates)
 # None template_path means "fully regenerated without markers" (field-bindings.json).
 _MANAGED_FILES: list[tuple[str, Optional[str]]] = [
-    ("agentOS.yaml", "agentOS.yaml"),
+    ("agentOS.yaml", None),  # specVersion bump only — see _handle_spec_version_bump
     (".github/workflows/agent-orchestrator.yml", "workflows/agent-orchestrator.yml"),
     ("agents/builder/AGENT.md", "agents/builder/AGENT.md.template"),
     ("agents/reviewer/AGENT.md", "agents/reviewer/AGENT.md.template"),
@@ -371,8 +371,10 @@ def upgrade_file(
     # Parse new template into its managed blocks keyed by block_id.
     new_segments = split_managed_blocks(new_template_content)
     new_blocks: dict[str, str] = {}
+    template_has_markers = False
     for text, attrs in new_segments:
         if attrs is not None:
+            template_has_markers = True
             block_id = attrs.get("role") or attrs.get("name") or ""
             if block_id:
                 new_blocks[block_id] = text
@@ -390,7 +392,24 @@ def upgrade_file(
             continue
 
         block_id = attrs.get("role") or attrs.get("name") or ""
-        new_block_text = new_blocks.get(block_id)
+
+        if template_has_markers:
+            # Multi-block template (e.g. agentOS.yaml): look up this block_id.
+            # A genuine miss here means the block was removed upstream.
+            new_block_text = new_blocks.get(block_id)
+        else:
+            # Raw, unmarked template (e.g. AGENT.md.template): the entire
+            # template *is* this block's new content. There is no marker to
+            # match against because single-block templates are never
+            # pre-wrapped on disk — only `instrument_files` wraps them, and
+            # only at first-provision time. Treating "no markers found" as
+            # "block removed" would silently delete file content on every
+            # upgrade, so instead the whole template is the new block body.
+            # Pad the same way wrap_in_managed_block does, so the rendered
+            # block has a newline after the begin marker and before the end
+            # marker rather than running text up against the comment.
+            stripped = new_template_content.strip("\n")
+            new_block_text = ("\n" + stripped + "\n") if stripped else None
 
         decision = decide_block_upgrade(
             file_path=file_path,
@@ -672,7 +691,18 @@ def run_upgrade(opts: UpgradeOptions) -> UpgradeResult:
             continue
 
         # field-bindings.json: fully regenerated, no block diffing.
+        # agentOS.yaml: specVersion bump only — it's the user's own structured
+        # config (labels, board fields, plugins), not boilerplate to re-diff.
         if template_rel is None:
+            if target_rel == "agentOS.yaml":
+                _handle_spec_version_bump(
+                    target_file=target_file,
+                    target_rel=target_rel,
+                    to_version=to_version,
+                    result=result,
+                    dry_run=opts.dry_run,
+                )
+                continue
             _handle_fully_regenerated(
                 target_file=target_file,
                 target_rel=target_rel,
@@ -744,6 +774,80 @@ def run_upgrade(opts: UpgradeOptions) -> UpgradeResult:
         _write_upgrade_conflicts(all_conflicts, target_dir)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# agentOS.yaml specVersion bump (no managed blocks, no full re-diff)
+# ---------------------------------------------------------------------------
+
+_SPEC_VERSION_LINE_RE = re.compile(r'^(specVersion:\s*)(.*)$', re.MULTILINE)
+
+
+def _handle_spec_version_bump(
+    target_file: Path,
+    target_rel: str,
+    to_version: str,
+    result: UpgradeResult,
+    dry_run: bool,
+) -> None:
+    """Bump the ``specVersion:`` field in the user's agentOS.yaml.
+
+    agentOS.yaml is the user's own structured config — labels, board fields,
+    plugins, comments — not boilerplate to re-diff against a template. The
+    only thing an upgrade needs to change in it is the version marker, so
+    this does a targeted line replace rather than parsing+re-dumping the
+    whole file (which would reformat it and lose comments).
+
+    The replacement value matches whatever quoting style (if any) the user's
+    specVersion line already uses.
+    """
+    raw = target_file.read_text(encoding="utf-8")
+
+    match = _SPEC_VERSION_LINE_RE.search(raw)
+    if match is None:
+        result.errors.append(
+            f"{target_rel}: could not find a `specVersion:` line — skipping version bump"
+        )
+        return
+
+    current_value_raw = match.group(2).strip()
+
+    # to_version is something like "v1.1.0"; agentOS.yaml's specVersion has
+    # historically been unprefixed and abbreviated (e.g. "1.1"), so normalize
+    # by stripping a leading "v".
+    new_value_bare = to_version.lstrip("vV")
+
+    if current_value_raw.startswith('"') and current_value_raw.endswith('"'):
+        new_value = f'"{new_value_bare}"'
+    elif current_value_raw.startswith("'") and current_value_raw.endswith("'"):
+        new_value = f"'{new_value_bare}'"
+    else:
+        new_value = new_value_bare
+
+    if current_value_raw.strip("\"'") == new_value_bare:
+        result.files_unchanged.append(target_rel)
+        log.debug("%s: specVersion already %s — no-op", target_rel, new_value_bare)
+        return
+
+    updated = _SPEC_VERSION_LINE_RE.sub(
+        lambda m: m.group(1) + new_value, raw, count=1
+    )
+
+    fc = FileChange(
+        path=target_rel,
+        blocks_updated=1,
+        unified_diff="".join(difflib.unified_diff(
+            raw.splitlines(keepends=True),
+            updated.splitlines(keepends=True),
+            fromfile=f"a/{target_rel}",
+            tofile=f"b/{target_rel}",
+        )),
+    )
+    result.files_changed.append(fc)
+
+    if not dry_run:
+        target_file.write_text(updated, encoding="utf-8")
+        log.info("%s: specVersion %s → %s", target_rel, current_value_raw, new_value)
 
 
 # ---------------------------------------------------------------------------

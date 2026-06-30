@@ -2,11 +2,12 @@
 bootstrap/cli.py — agentOS CLI entry point.
 
 Subcommands:
-  agentOS init   [--from source]           Generate agentOS.yaml
-  agentOS setup  --repo owner/repo         Register GitHub Apps (interactive)
-  agentOS apply  --repo owner/repo [flags] Provision labels, board, workflows
-  agentOS verify --repo owner/repo         Health check against agentOS.yaml
-  agentOS token  <role>                    Print a short-lived App token
+  agentOS init    [--from source]           Generate agentOS.yaml
+  agentOS setup   --repo owner/repo         Register GitHub Apps (interactive)
+  agentOS apply   --repo owner/repo [flags] Provision labels, board, workflows
+  agentOS upgrade [--repo owner/repo]       Upgrade a provisioned repo to a newer spec version
+  agentOS verify  --repo owner/repo         Health check against agentOS.yaml
+  agentOS token   <role>                    Print a short-lived App token
 
 Global flags:
   --spec PATH    Path to agentOS.yaml (default: ./agentOS.yaml)
@@ -199,10 +200,28 @@ def cmd_setup(args: argparse.Namespace) -> int:
 # upgrade (invoked via `agentOS apply --upgrade`)
 # ---------------------------------------------------------------------------
 
+def _print_diffs(result) -> None:
+    """Print the unified diff for every changed file in an UpgradeResult."""
+    for fc in result.files_changed:
+        if not fc.unified_diff:
+            continue
+        print(f"\n--- {fc.path} ---")
+        print(fc.unified_diff.rstrip("\n"))
+
+
 def cmd_upgrade(args: argparse.Namespace) -> int:
     """Upgrade a provisioned repo to a newer spec version.
 
-    Called automatically by cmd_apply when --upgrade is set.
+    Reachable as `agentOS upgrade` (preferred) or the deprecated
+    `agentOS apply --upgrade` alias.
+
+    Flow:
+      1. Always run a dry-run pass first to compute the plan (file diffs,
+         conflicts) without writing anything.
+      2. Print the summary and per-file unified diffs.
+      3. If the caller asked for --dry-run, stop here.
+      4. Otherwise, prompt for confirmation (unless --yes was passed) before
+         writing any changes for real.
     """
     _load_env(Path(args.env))
 
@@ -217,18 +236,57 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
         spec_path = Path(args.spec)
     spec = _load_spec(spec_path)
 
-    opts = UpgradeOptions(
+    base_opts = dict(
         target_dir=target_dir,
         templates_dir=Path(templates_dir_arg) if templates_dir_arg else None,
         to_version=getattr(args, "upgrade_to", None) or None,
         to_version_explicit=bool(getattr(args, "upgrade_to", None)),
-        dry_run=getattr(args, "dry_run", False),
         repo=getattr(args, "repo", None),
         token=_resolve_token("GITHUB_TOKEN"),
         spec=spec,
     )
 
-    result = run_upgrade(opts)
+    # Step 1: always plan first, dry-run, regardless of what the caller asked for.
+    plan = run_upgrade(UpgradeOptions(dry_run=True, **base_opts))
+    plan.print_summary()
+    _print_diffs(plan)
+
+    if not plan.ok:
+        return 1
+
+    # Nothing to do.
+    if not plan.files_changed:
+        return 0
+
+    user_requested_dry_run = getattr(args, "dry_run", False)
+    if user_requested_dry_run:
+        return 0
+
+    if plan.conflicts:
+        print(
+            f"\n{len(plan.conflicts)} conflict(s) detected — those blocks will be "
+            "left unchanged and logged to .agentOS/upgrade-conflicts.yaml.",
+            file=sys.stderr,
+        )
+
+    # Step 2: confirm before writing, unless explicitly skipped.
+    skip_confirm = getattr(args, "yes", False)
+    if not skip_confirm:
+        print(
+            f"\nApply the above changes to {len(plan.files_changed)} file(s) "
+            f"in {target_dir}?"
+        )
+        try:
+            answer = input("  Type 'yes' to continue: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted — no changes made.", file=sys.stderr)
+            return 1
+        if answer != "yes":
+            print("Aborted — no changes made.", file=sys.stderr)
+            return 1
+
+    # Step 3: run for real.
+    result = run_upgrade(UpgradeOptions(dry_run=False, **base_opts))
     result.print_summary()
     return 0 if result.ok else 1
 
@@ -390,7 +448,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Show what would happen without making changes")
     p_apply.add_argument("--reset", action="store_true",
                          help="Reset state file and re-run all steps from scratch")
-    # Upgrade flags — active when --upgrade is set.
+    # Upgrade flags — deprecated alias, active when --upgrade is set.
+    # Prefer the top-level `agentOS upgrade` subcommand instead.
     p_apply.add_argument(
         "--instrument", action="store_true",
         help=(
@@ -401,8 +460,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_apply.add_argument(
         "--upgrade", action="store_true",
         help=(
-            "Upgrade a provisioned repo from its current spec version to a newer one. "
-            "Only modifies content inside <!-- agentOS:managed:begin/end --> markers."
+            "[deprecated, use `agentOS upgrade`] Upgrade a provisioned repo from "
+            "its current spec version to a newer one. Only modifies content "
+            "inside <!-- agentOS:managed:begin/end --> markers."
         ),
     )
     p_apply.add_argument(
@@ -413,6 +473,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--templates-dir", dest="templates_dir", metavar="PATH",
         help="Local templates/ directory to use for --upgrade (default: bundled or fetched)",
     )
+    p_apply.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation prompt when used with --upgrade",
+    )
+
+    # upgrade — preferred top-level entry point.
+    p_upgrade = sub.add_parser(
+        "upgrade",
+        help="Upgrade a provisioned repo to a newer spec version (shows diffs, asks to confirm)",
+    )
+    p_upgrade.add_argument("--repo", metavar="OWNER/REPO",
+                           help="owner/repo (used to query the latest GitHub release tag)")
+    p_upgrade.add_argument("--target-dir", help="Local checkout of the provisioned repo (default: cwd)")
+    p_upgrade.add_argument("--to", dest="upgrade_to", metavar="VERSION",
+                           help="Target spec version (default: latest GitHub release tag)")
+    p_upgrade.add_argument("--templates-dir", dest="templates_dir", metavar="PATH",
+                           help="Local templates/ directory (default: bundled or fetched)")
+    p_upgrade.add_argument("--dry-run", action="store_true",
+                           help="Show the plan and diffs without writing any changes")
+    p_upgrade.add_argument("--yes", "-y", action="store_true",
+                           help="Skip the confirmation prompt and apply immediately")
 
     # verify
     p_verify = sub.add_parser("verify", help="Check repo matches agentOS.yaml")
@@ -441,6 +522,7 @@ def main() -> int:
         "init": cmd_init,
         "setup": cmd_setup,
         "apply": cmd_apply,
+        "upgrade": cmd_upgrade,
         "verify": cmd_verify,
         "token": cmd_token,
     }
