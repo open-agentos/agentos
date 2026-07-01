@@ -4,6 +4,8 @@ By the end of this quick setup guide, you will have a GitHub repository provisio
 
 If at any time you wish to stop and reverse out of the installation process, you can uninstall it by referring to the [uninstall guide](./uninstall.md).
 
+You can also build the system yourself. For an explanation of how to do this, see [DIY AgentOS](./diy-agentos.md).
+
 ---
 
 ## Fast path

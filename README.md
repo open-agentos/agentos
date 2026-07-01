@@ -84,6 +84,7 @@ Then label an issue `type:feature` + `status:todo` and watch the PR open. Full w
 - [Metrics Schema](./docs/metrics-schema.md) — the run-record corpus
 - [Specification](./SPEC.md) — the normative reference
 - [Uninstall](./docs/uninstall.md) — how to remove agentOS from a repo
+- [DIY AgentOS](./docs/diy-agentos.md) — build your own agent loop
 
 ## License
 
