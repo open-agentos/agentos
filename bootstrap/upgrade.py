@@ -812,7 +812,7 @@ def _handle_spec_version_bump(
 
     current_value_raw = match.group(2).strip()
 
-    # to_version is something like "v11.0"; agentOS.yaml's specVersion has
+    # to_version is something like "v1.2.0"; agentOS.yaml's specVersion has
     # historically been unprefixed and abbreviated (e.g. "1.1"), so normalize
     # by stripping a leading "v".
     new_value_bare = to_version.lstrip("vV")
