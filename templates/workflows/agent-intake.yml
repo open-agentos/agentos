@@ -62,6 +62,10 @@ jobs:
     name: Classify pull request
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    permissions:
+      issues: write
+      pull-requests: write
+      contents: read
     concurrency:
       # One classification at a time per PR — serialises rapid push bursts.
       group: intake-classify-${{ github.event.pull_request.number }}
