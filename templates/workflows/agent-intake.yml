@@ -278,38 +278,47 @@ jobs:
               stubNumber = created.number;
               console.log(`Created stub #${stubNumber}.`);
 
-              // Closing-link the PR to the stub (§12.4.1 step 3) — prepend,
-              // preserving existing content. This is the ONLY intake data on the PR.
-              // Guard: PATCH /pulls requires pull_requests:write. When no App token
-              // is configured the fallback GITHUB_TOKEN is blocked by GitHub on
-              // synchronize events (security restriction, not a permissions bug).
-              // Skip gracefully — the stub comment still identifies the linkage.
-              const prBody = pr.body || '';
-              if (!prBody.includes(`Closes #${stubNumber}`) && process.env.WATCHER_TOKEN) {
+              // PR-facing writes (body update + comment) require a watcher App token.
+              // GitHub blocks PATCH /pulls and POST /issues/{pr}/comments via the
+              // fallback GITHUB_TOKEN on synchronize events regardless of the
+              // permissions block — this is a platform restriction, not a config gap.
+              // When no App is configured, skip both writes gracefully; the stub
+              // issue itself records the classification and is sufficient for tracking.
+              if (process.env.WATCHER_TOKEN) {
+                // Closing-link the PR to the stub (§12.4.1 step 3)
+                const prBody = pr.body || '';
+                if (!prBody.includes(`Closes #${stubNumber}`)) {
+                  try {
+                    await github.rest.pulls.update({
+                      owner, repo, pull_number: prNumber,
+                      body: `Closes #${stubNumber}\n\n${prBody}`
+                    });
+                  } catch (e) {
+                    console.log(`Could not update PR body (${e.status}): ${e.message}`);
+                  }
+                }
+
+                // First PR comment (§12.4.1 step 4)
                 try {
-                  await github.rest.pulls.update({
-                    owner, repo, pull_number: prNumber,
-                    body: `Closes #${stubNumber}\n\n${prBody}`
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: prNumber,
+                    body: [
+                      `This pull request has no linked issue, so agentOS intake created stub issue #${stubNumber} to track it.`,
+                      '',
+                      '**What happens next:**',
+                      '1. Deterministic janitors run against this branch (report mode posts check runs; autofix mode, if enabled, pushes formatting-class commits).',
+                      '2. The archaeologist reconstructs the intent of this change into the stub issue.',
+                      '3. A maintainer reviews the reconstruction and comments `/approve-intent`, after which the normal review loop begins.',
+                      '',
+                      '> **Tip:** if autofix janitors are enabled they may push commits to this branch. Use `git pull --rebase` before pushing again.'
+                    ].join('\n')
                   });
                 } catch (e) {
-                  console.log(`Could not update PR body (${e.status}): ${e.message}. Stub #${stubNumber} still tracks this PR via the comment.`);
+                  console.log(`Could not post PR comment (${e.status}): ${e.message}`);
                 }
+              } else {
+                console.log('No watcher App token — skipping PR body update and comment (requires App token to write to PRs on synchronize events).');
               }
-
-              // First PR comment (§12.4.1 step 4) — includes the rebase norm (§12.5.3).
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: prNumber,
-                body: [
-                  `This pull request has no linked issue, so agentOS intake created stub issue #${stubNumber} to track it.`,
-                  '',
-                  '**What happens next:**',
-                  '1. Deterministic janitors run against this branch (report mode posts check runs; autofix mode, if enabled, pushes formatting-class commits).',
-                  '2. The archaeologist reconstructs the intent of this change into the stub issue.',
-                  '3. A maintainer reviews the reconstruction and comments `/approve-intent`, after which the normal review loop begins.',
-                  '',
-                  '> **Tip:** if autofix janitors are enabled they may push commits to this branch. Use `git pull --rebase` before pushing again.'
-                ].join('\n')
-              });
             }
             core.setOutput('stub_number', String(stubNumber));
 
