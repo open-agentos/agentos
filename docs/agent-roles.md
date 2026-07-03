@@ -1,9 +1,10 @@
 # Agent Roles Reference
 
-agentOS uses four core GitHub Apps (builder, reviewer, watcher, board) and two
-optional Apps (docs, planner). Each App maps to a distinct agent role with a
-distinct permission set, a distinct trigger condition, and a distinct runtime
-interface. This document covers all six roles.
+agentOS uses four core GitHub Apps (builder, reviewer, watcher, board), two
+optional Apps (docs, planner), and — with the v1.2 intake pipeline — a fifth
+App (janitor) plus one deliberately App-less role (archaeologist). Each role
+has a distinct permission set, a distinct trigger condition, and a distinct
+runtime interface. This document covers all eight roles.
 
 ---
 
@@ -510,6 +511,104 @@ governance:
 With `planning: off`, the builder fires on `status:todo` unconditionally (legacy
 behaviour). With `planning: optional`, issues may go directly to `status:todo` and
 build without a plan block; an approval is still required.
+
+---
+
+## 7.2 janitor (intake, v1.2)
+
+The janitor role is deterministic cleanup tooling run against wild PR branches
+during `status:intake` (SPEC.md §12.5). It is not an LLM agent: janitors are
+tool commands (formatters, linters, scanners) declared in `intake.janitors`,
+run serially in declared order.
+
+### Permission table
+
+    Permission                    Level     Reason
+    ----------------------------  --------  ------------------------------------------
+    contents                      write     Push autofix commits to wild PR branches
+    checks                        write     Publish report-tier findings as check runs
+    pull_requests                 write     Comment on PRs (findings summaries)
+    metadata                      read      Required by all Apps (implicit)
+
+Deliberately absent: `issues:write` (janitors never touch the stub or any other
+issue), `workflows:write` (janitor commits can never smuggle workflow changes),
+and any review or approval capability. A janitor App credential, fully
+compromised, can push syntactic commits to unprotected PR branches and nothing
+else — and every such commit is App-attributed and revertable as a unit.
+
+### The tier criterion
+
+A janitor may run in **autofix** mode (pushes commits) only if its transform is
+deterministic (no LLM anywhere in the path), semantics-preserving by
+construction, and idempotent. Everything else is **report** mode (check runs +
+findings). Security tools are report-only categorically: a janitor MUST NOT
+apply autofixes offered by a security tool.
+
+### Commit discipline
+
+Each autofix janitor that changes anything pushes its own commit under the
+janitor App identity with trailers:
+
+    AgentOS-Janitor: <name>
+    AgentOS-Run-Id: <run id>
+
+Janitors never amend, squash, force-push, or modify commits authored by anyone
+else. After the sequence completes it must re-run to an empty diff
+(convergence); non-convergence reverts all janitor commits, demotes the set to
+report mode for that PR, and files a config bug.
+
+### What janitor cannot do
+
+- Edit issues or labels (no issues:write — all label transitions are the
+  intake workflow's job, authenticated as watcher).
+- Push to protected branches.
+- Run on fork PRs in autofix mode (hardened mode: report only).
+- Apply security autofixes, rewrite history, or delete pushed secrets
+  (secret findings demand rotation, not removal).
+
+---
+
+## 7.3 archaeologist (intake, v1.2)
+
+The archaeologist reconstructs intent from unplanned work (SPEC.md §12.6). It
+is the first agentOS role whose entire input is untrusted by design, and its
+contract is correspondingly stricter than any existing role.
+
+### A pure function — no App, no token
+
+The archaeologist has **no GitHub App identity and holds no token**. It is a
+pure function: diff and context in, one JSON payload out. The orchestrator
+performs every side effect on its behalf — after validating the payload
+against the SPEC.md §12.6.4 schema.
+
+The rationale is a gap App scoping cannot close: GitHub permissions are not
+row-level. An `issues:write` token can edit *any* issue in the repository; a
+hijacked archaeologist holding one could rewrite approved plans on unrelated
+issues. Mediated writes reduce its fully-hijacked blast radius to a misleading
+string rendered inside a template, adjacent to deterministic facts, read by a
+human.
+
+### Runner constraints
+
+The archaeologist runner MUST NOT be granted shell execution, network access,
+or any tool with side effects. The diff, PR title, branch name, and commit
+messages are delimited and declared untrusted data in the prompt contract.
+URLs appearing in the diff are data, never fetch targets.
+
+### Output contract
+
+One JSON payload: interpretation, confidence (high/medium/low), proposed_type,
+scope array, proposed_title, questions array. Schema violations are a failed
+run: the orchestrator retries once, then routes the stub to `status:blocked`.
+
+### Triggering
+
+Dispatched by the intake workflow after tripwires pass and janitors settle
+(concurrency group keyed on the stub issue number). Same-repo author replies
+to its questions re-dispatch it with the reply as high-weight context; fork
+author replies never do (spam/injection vector) — a maintainer comment may.
+Cost caps: `intake.max_diff_lines` (facts-only above it) and
+`intake.max_recon_runs` per stub.
 
 ---
 

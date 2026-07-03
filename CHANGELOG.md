@@ -10,6 +10,105 @@ version. Each major bump ships a corresponding MIGRATION-vN.md in the repo root.
 
 ---
 
+## [1.2.0] — 2026-07-03
+
+The intake release: unplanned ("wild") pull requests become first-class
+citizens of the label state machine. A developer's entire interface is
+`git push` + open a PR; the system classifies the PR, creates a system-owned
+stub issue, runs deterministic janitors, reconstructs intent via the
+archaeologist, and gates entry to the review loop behind `/approve-intent`.
+No breaking changes — intake is additive and ships with every janitor in
+report mode (behaviourally invisible: no pushes, no diff mutations).
+
+`specVersion` bumps from `"1.1"` to `"1.2"`.
+
+### Added
+
+**SPEC.md §12 — Intake (new normative section)**
+- Classification rule (§12.2): syntactic-only — non-agent author, not in
+  `exclude_actors`, no closing-linked issue. Heuristic classification is
+  explicitly forbidden.
+- The recursion guard (§12.2.4): agent-identity pushes never reset intake
+  state (GitHub's Actions loop protection covers GITHUB_TOKEN only, not
+  App-token pushes). Normative and load-bearing; implementations MUST test it.
+- Fork hardening (§12.2.5) and a `pull_request_target` prohibition (§12.2.6).
+- The stub issue (§12.4): system-owned, idempotent creation, closing-linked
+  to the PR, PLAN-marker reuse for the reconstruction.
+- The janitor layer (§12.5): capability-based autofix/report tiering,
+  serial execution after a settle window, per-tool App-attributed commits
+  with AgentOS-Janitor trailers, convergence requirement, test oracle with
+  self-demotion, secrets handling (rotation, never removal).
+- The archaeologist (§12.6): a pure function with no GitHub token; tripwire
+  paths evaluated before any model runs; schema-validated JSON output
+  contract; mediated writes; re-run and cost-cap rules.
+- The intake-review comment and `/approve-intent` (§12.7): facts before
+  interpretation (normative ordering), live permission check, staleness rule
+  (approval must postdate the latest push).
+- Report-to-work (§12.8): findings filed as follow-on issues at settlement
+  (merge, not approval), fingerprint dedup, first-class recorded dismissal.
+- Provenance-weighted governance (§12.9): `governance.wild` — no auto-merge,
+  human final approval, max 2 review cycles, changes-requested routing;
+  threat model, janitor permission table, residual risks, rejected
+  alternatives.
+- Receipts and metrics (§12.10), configuration reference (§12.11), deferred
+  features (§12.12: trailing mode, the Splitter, autofix on linked PRs).
+- Intake conformance criteria appended to §11.
+
+**Labels (8 new)**
+- `source:wild` — set once at stub creation; never changed, never removed
+- `status:intake` — routes to archaeologist (after janitors settle)
+- `status:intake-review` — awaiting `/approve-intent`; no agent
+- `follow-on:needs-cleanup`, `follow-on:needs-tests`,
+  `follow-on:needs-security-review` — consumed by watcher at settlement
+- `agent:janitor`, `agent:archaeologist` — ownership/observability labels
+
+**agentOS.yaml**
+- `intake:` config block with defaults (exclude_actors, linked_prs,
+  settle_seconds, convergence_passes, test_oracle, max_diff_lines,
+  max_recon_runs, model, approve_intent_self, tripwire_paths, janitors,
+  reports). Ships enabled with every janitor in report mode.
+- `governance.wild` block (auto_merge, final_approval, max_review_cycles,
+  changes_requested_routes_to).
+- Janitor role (create_app: true; contents:write + checks:write +
+  pull_requests:write; deliberately NO issues:write / workflows:write).
+- Archaeologist role (create_app: false, no App identity — mediated writes).
+- Board options: Intake / Intake review status values; Janitor /
+  Archaeologist role values.
+
+**Workflow template**
+- `templates/workflows/agent-intake.yml` — classifier (classification rule,
+  recursion guard, draft/fork handling, tripwires, idempotent stub
+  lifecycle), janitor executor (settle window, convergence, hardened fork
+  mode), archaeologist dispatch (tokenless, schema-validated payload,
+  mediated writes, facts-first intake-review comment), and the
+  `/approve-intent` gate (live permission check, self-approval config,
+  staleness rule).
+
+**Agent scaffold**
+- `templates/agents/archaeologist/AGENT.md.template` — pure-function
+  contract, untrusted-input rules, output schema.
+- AGENTS.md role table and state machine updated with the intake lane and
+  the `/approve-intent` + `/dismiss-findings` commands.
+
+**Schema**
+- `schema/agentOS.schema.json`: new `intake` and `governance` blocks
+  (governance existed in agentOS.yaml since 1.1.0 but was missing from the
+  schema — with `additionalProperties: false` any validation of a v1.1 spec
+  file would have failed; fixed here).
+- Fixed the `specId` pattern, which rejected the shipped value
+  `github-agentOS` (no uppercase allowed). A new test validates the root
+  agentOS.yaml against the schema so this class of drift is caught in CI.
+
+**Docs**
+- docs/label-model.md: intake status values, wild-lane state machine graft,
+  `source:wild`, intake follow-on labels.
+- docs/agent-roles.md: janitor (§7.2) and archaeologist (§7.3) role entries.
+- docs/metrics-schema.md: §11.1 intake extensions — janitor/archaeologist
+  run records, wild settlement records, `gates_bypassed`, dashboard
+  additions; multiple-settlement-records tolerance note.
+
+---
+
 ## [1.1.0] — 2026-06-29
 
 Planning stage and dispatch-time approval gate. No breaking changes — all existing
