@@ -280,12 +280,20 @@ jobs:
 
               // Closing-link the PR to the stub (§12.4.1 step 3) — prepend,
               // preserving existing content. This is the ONLY intake data on the PR.
+              // Guard: PATCH /pulls requires pull_requests:write. When no App token
+              // is configured the fallback GITHUB_TOKEN is blocked by GitHub on
+              // synchronize events (security restriction, not a permissions bug).
+              // Skip gracefully — the stub comment still identifies the linkage.
               const prBody = pr.body || '';
-              if (!prBody.includes(`Closes #${stubNumber}`)) {
-                await github.rest.pulls.update({
-                  owner, repo, pull_number: prNumber,
-                  body: `Closes #${stubNumber}\n\n${prBody}`
-                });
+              if (!prBody.includes(`Closes #${stubNumber}`) && process.env.WATCHER_TOKEN) {
+                try {
+                  await github.rest.pulls.update({
+                    owner, repo, pull_number: prNumber,
+                    body: `Closes #${stubNumber}\n\n${prBody}`
+                  });
+                } catch (e) {
+                  console.log(`Could not update PR body (${e.status}): ${e.message}. Stub #${stubNumber} still tracks this PR via the comment.`);
+                }
               }
 
               // First PR comment (§12.4.1 step 4) — includes the rebase norm (§12.5.3).
