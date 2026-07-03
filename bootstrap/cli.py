@@ -515,7 +515,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--instrument", action="store_true",
         help=(
             "Add managed-block markers to already-provisioned files without "
-            "re-running other steps. Safe to run on repos provisioned before v1.1.0."
+            "re-running other steps. Safe to run on repos provisioned before v1.2.0."
         ),
     )
     p_apply.add_argument(

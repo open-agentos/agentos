@@ -94,10 +94,10 @@ class TestTagFetchFailure:
 
     def test_tag_fetch_fails_with_explicit_to_proceeds_normally(self, tmp_path):
         """When --to is explicit, tag fetch failure is irrelevant — proceed normally."""
-        opts = self._opts(tmp_path, to_version="v1.1.0", explicit=True)
+        opts = self._opts(tmp_path, to_version="v1.2.0", explicit=True)
         # Even if tag fetch would fail, it should never be called when --to is set.
         with patch("bootstrap.upgrade._fetch_latest_tag", return_value="") as mock_fetch:
-            # The from_version is 1.0.0-alpha, to_version is v1.1.0 — they differ,
+            # The from_version is 1.0.0-alpha, to_version is v1.2.0 — they differ,
             # so the upgrade will try to find templates. That's fine — we just check
             # the tag fetch path is not taken.
             result = run_upgrade(opts)
@@ -110,7 +110,7 @@ class TestTagFetchFailure:
     def test_tag_fetch_succeeds_no_to_flag_proceeds(self, tmp_path):
         """When the tag fetch succeeds and --to is not set, no error is raised."""
         opts = self._opts(tmp_path)
-        with patch("bootstrap.upgrade._fetch_latest_tag", return_value="v1.1.0"):
+        with patch("bootstrap.upgrade._fetch_latest_tag", return_value="v1.2.0"):
             result = run_upgrade(opts)
         # May have other errors (missing templates etc.) but NOT a tag error.
         assert "Could not determine target version" not in " ".join(result.errors)
@@ -129,7 +129,7 @@ class TestTagFetchFailure:
         """to_version_explicit=True means _fetch_latest_tag is never called."""
         opts = UpgradeOptions(
             target_dir=tmp_path,
-            to_version="v1.1.0",
+            to_version="v1.2.0",
             to_version_explicit=True,
             dry_run=True,
             spec={"specVersion": "1.0.0-alpha", "runtime": {}},

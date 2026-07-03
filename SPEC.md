@@ -743,7 +743,7 @@ Plugins are listed in agentOS.yaml:
 ```yaml
 plugins:
   - name: three-questions
-    source: github:open-agentos/agentos//plugins/three-questions@v1.1.0
+    source: github:open-agentos/agentos//plugins/three-questions@v1.2.0
 ```
 
 Sources supported in v1.0:
@@ -845,7 +845,7 @@ intake-conformant if additionally:
 
 ### 12.1 Purpose and non-goals
 
-agentOS v1.1 is intent-first: an issue exists, a plan is approved, an agent
+agentOS v1.2 is intent-first: an issue exists, a plan is approved, an agent
 produces code, receipts accumulate. Real development includes a second mode: a
 developer (or their local coding agent) produces code first, in their own
 environment, with no issue and no plan. Without intake that work is invisible
