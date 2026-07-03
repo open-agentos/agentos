@@ -10,6 +10,29 @@ version. Each major bump ships a corresponding MIGRATION-vN.md in the repo root.
 
 ---
 
+## [1.2.1] — 2026-07-03
+
+Patch release. Fixes three bugs in `agent-intake.yml` discovered when
+running the intake workflow against a repo with no GitHub Apps configured.
+
+### Fixed
+
+- **Missing `permissions:` block on classify job** — without an explicit
+  block the fallback `GITHUB_TOKEN` is read-only; `PATCH /pulls` returned
+  403. Added `issues: write`, `pull-requests: write`, `contents: read`.
+- **PR body update not guarded against missing App token** — GitHub blocks
+  `PATCH /pulls/{n}` via `GITHUB_TOKEN` on `synchronize` events regardless
+  of the permissions block. Wrapped in `WATCHER_TOKEN` guard; degrades
+  gracefully when no App is configured.
+- **PR comment has the same platform restriction** — `POST /issues/{pr}/comments`
+  on a PR number is equally blocked. Consolidated both PR-facing writes under
+  the single `WATCHER_TOKEN` guard.
+
+No `specVersion` bump — these are workflow fixes only; the spec contract
+is unchanged.
+
+---
+
 ## [1.2.0] — 2026-07-03
 
 The intake release: unplanned ("wild") pull requests become first-class

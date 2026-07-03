@@ -3,7 +3,7 @@
 # Human-readable, git-diffable, versioned.
 #
 # Import this file into your project with:
-#   agentOS init --from github:open-agentos/agentos@v1.2.0
+#   agentOS init --from github:open-agentos/agentos@v1.2.1
 #
 # Then provision your repository with:
 #   agentOS apply --repo owner/my-repo
@@ -666,5 +666,5 @@ plugins: []
 # Example — uncomment to activate the reference 3Qs plugin:
 # plugins:
 #   - name: three-questions
-#     source: github:open-agentos/agentos//plugins/three-questions@v1.2.0
+#     source: github:open-agentos/agentos//plugins/three-questions@v1.2.1
 #     description: "Daily 3Qs intelligence plugin — phase labels, watcher schedule"
