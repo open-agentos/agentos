@@ -93,7 +93,7 @@ report mode (behaviourally invisible: no pushes, no diff mutations).
 **Schema**
 - `schema/agentOS.schema.json`: new `intake` and `governance` blocks
   (governance existed in agentOS.yaml since 1.1.0 but was missing from the
-  schema — with `additionalProperties: false` any validation of a v1.1 spec
+  schema — with `additionalProperties: false` any validation of a v1.2 spec
   file would have failed; fixed here).
 - Fixed the `specId` pattern, which rejected the shipped value
   `github-agentOS` (no uppercase allowed). A new test validates the root

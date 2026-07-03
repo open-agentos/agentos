@@ -187,7 +187,7 @@ def test_status_intake_routes_to_archaeologist_in_spec(spec):
 def test_agentos_yaml_validates_against_schema(spec):
     """The root agentOS.yaml must validate against its own JSON schema.
 
-    This is the guard that would have caught the v1.1 drift where the
+    This is the guard that would have caught the v1.2 drift where the
     governance: block existed in agentOS.yaml but not in the schema
     (additionalProperties: false makes that a hard failure).
     """
