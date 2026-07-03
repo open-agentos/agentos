@@ -68,6 +68,9 @@ primary mechanism by which agents hand off work to each other.
     ----------------------  -----------  -----------------------------------------------
     status:plan             c5def5       Expand this issue into a plan (planner entry).
     status:plan-review      e4e669       Plan written; awaiting admin /approve-plan.
+    status:intake           c5b8f0       Wild PR classified. Janitors running or settling;
+                                         archaeologist queued. (Intake lane, SPEC.md §12.)
+    status:intake-review    e4d069       Reconstruction written; awaiting /approve-intent.
     status:todo             ededed       Ready to be picked up by the orchestrator.
     status:in-progress      0075ca       Builder agent is actively working on this issue.
     status:in-review        0052cc       PR is open; reviewer agent is evaluating it.
@@ -114,6 +117,34 @@ Manual review-me-first path:
   author plan in markers → open at status:plan-review → admin /approve-plan → status:todo → builder
 ```
 
+### State machine graft — the intake (wild) lane
+
+Unplanned PRs (no closing-linked issue, non-agent author) enter through the
+intake lane (SPEC.md §12). All intake state lives on the system-created stub
+issue, never on the PR:
+
+```
+unplanned PR (ready for review)
+        |
+        |  classifier: create stub issue, closing-link it,
+        |  apply source:wild + status:intake
+        v
+  status:intake ──────────── tripwire or hard finding ────► status:blocked
+        |                                                      (human)
+        |  janitors settle; archaeologist runs;
+        |  reconstruction written to stub body
+        v
+  status:intake-review
+        |
+        |  /approve-intent (must postdate latest push)
+        v
+  status:in-review ──► existing loop, unchanged
+```
+
+Any author push while in `status:intake-review` or later (pre-merge) returns
+the stub to `status:intake`. Agent-identity pushes never reset intake state
+(the recursion guard, SPEC.md §12.2.4).
+
 Notes:
 - `status:plan` is the planner entry point. Applying it fires the planner.
 - `status:plan-review` means "plan written; no agent dispatch — awaiting human."
@@ -150,6 +181,11 @@ orchestrator which agent role to dispatch when that label is applied:
           routes_to: planner       # planner fires on this label
         plan-review:
           routes_to: null          # no agent; awaiting human /approve-plan
+        intake:
+          routes_to: archaeologist # dispatched by orchestrator after janitors
+                                   # settle and tripwires pass (SPEC.md §12)
+        intake-review:
+          routes_to: null          # no agent; awaiting human /approve-intent
 
 `routes_to: null` means the orchestrator acknowledges the transition but does not
 dispatch any agent. A human or a protected-branch merge event moves the issue onward.
@@ -172,6 +208,21 @@ status:plan-review
   `/request-changes <notes>` to send the issue back to `status:plan` for a revised
   plan. The orchestrator also watches for `issue_comment` events so it can act on
   these commands in real time.
+
+status:intake
+  A wild PR was classified and its stub issue created (SPEC.md §12). Tripwires
+  have passed. Janitors run against the branch (report mode immediately; autofix
+  mode only after the settle window with no author pushes). After janitors
+  converge, the archaeologist is dispatched to reconstruct intent into the stub
+  body. A tripwire match or a hard finding (e.g. secret detection) routes the
+  stub to `status:blocked` instead.
+
+status:intake-review
+  The reconstruction is written and the intake-review comment (facts first,
+  interpretation second) has been posted. No agent is dispatched. An authorised
+  approver comments `/approve-intent` to admit the work into the standard review
+  loop at `status:in-review`. Any author push during this state resets the stub
+  to `status:intake` and invalidates pending approvals.
 
 status:todo
   The issue is in the backlog and ready for automation. Applying this label (while a
@@ -230,6 +281,8 @@ and is NOT used as a workflow trigger.
     agent:watcher     The watcher is running settlement on this issue.
     agent:docs        The docs agent is updating documentation.
     agent:planner     The planner is writing a plan into the issue body.
+    agent:janitor     Janitor tooling is running on the linked wild PR.
+    agent:archaeologist  The archaeologist is reconstructing intent for this stub.
 
 ### When agent labels are set
 
@@ -339,6 +392,15 @@ and is never changed.
     source:agent          Issue was created by an agent (e.g., planner decomposition).
     source:import         Issue was imported from an external system (Jira, Linear, etc.).
     source:webhook        Issue was created by an incoming webhook (e.g., error alert).
+    source:wild           Issue was created by the intake classifier from an
+                          unplanned pull request (SPEC.md §12). Set once at stub
+                          creation; never changed, never removed — including
+                          after merge. The wild taint never washes off.
+
+> Note: the core agentOS.yaml currently provisions the human/agent origin pair
+> as `source:human-created` / `source:agent-created`. The shorter names in this
+> table are the v1.0 draft names; the label name in agentOS.yaml is
+> authoritative for provisioning. `source:wild` is identical in both.
 
 ### Usage
 
@@ -353,6 +415,10 @@ This default behaviour is configurable:
       auto_start_agent_issues: true   # default
       auto_start_human_issues: false  # default
 
+Wild provenance goes further: issues carrying `source:wild` get stricter
+downstream defaults via the `governance.wild` block (no auto-merge, human
+final approval, max 2 review cycles). See SPEC.md §12.9.
+
 ---
 
 ## 7. The Follow-On Axis
@@ -366,6 +432,19 @@ current run.
     follow-on:needs-docs      Documentation needs updating for this change.
     follow-on:needs-migration A database migration is required.
     follow-on:needs-deploy    A deployment action is queued.
+    follow-on:needs-cleanup   Report-tier lint/format/dead-code findings from
+                              intake (SPEC.md §12.8).
+    follow-on:needs-tests     Characterisation-test work for code touched by a
+                              wild PR (SPEC.md §12.8).
+    follow-on:needs-security-review  Semgrep / dependency-audit findings from
+                              intake. Spawned issues default to manual launch
+                              (SPEC.md §12.8.4).
+
+The three intake follow-on labels are applied to the stub issue during intake
+and consumed by the watcher at settlement (merge, not approval): one fresh
+issue per category, linking back to the stub, carrying the full findings
+report, entering the planned lane. A wild PR closed without merge takes its
+findings to the grave (`outcome=cancelled`) and spawns nothing.
 
 ### How routes_to is configured for follow-on
 

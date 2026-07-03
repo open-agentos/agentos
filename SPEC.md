@@ -1,6 +1,6 @@
 # GitHub AgentOS Specification
 
-**Version:** 1.0-draft
+**Version:** 1.2-draft
 **Status:** Draft
 **Org:** https://github.com/open-agentos
 
@@ -17,6 +17,7 @@ This document is the normative specification for the GitHub AgentOS system. It d
 5. The Projects v2 board field contract
 6. The JSONL run-record metrics schema
 7. The plugin interface for extending the core system
+8. The intake pipeline for unplanned ("wild") pull requests (§12)
 
 This spec does NOT define:
 - The content of agent system prompts (that is the operator's responsibility)
@@ -50,6 +51,30 @@ MUST / MUST NOT / SHOULD / SHOULD NOT / MAY follow RFC 2119.
 
   Plugin        An opt-in extension to the core spec. Plugins add labels, board fields,
                 workflows, and agent config without modifying the core spec file.
+
+  Wild work     Code pushed to the target repo (or a fork) with no closing-linked
+                issue, by an actor that is not an agentOS App. See §12.
+
+  Stub issue    A system-created issue that represents a wild PR inside the label
+                state machine. System-owned during intake. See §12.4.
+
+  Reconstruction  The intent document written into the stub issue body: a computed
+                facts block plus an LLM-authored interpretation. See §12.6.
+
+  Facts block   The portion of a reconstruction computed by deterministic tooling.
+                The archaeologist can reference it, never author it.
+
+  Janitor       A deterministic tool run against a wild branch during status:intake.
+                Operates in autofix or report mode. See §12.5.
+
+  Tripwire      A deterministic path- or content-based rule that routes a wild PR
+                to status:blocked before any agent runs. See §12.6.2.
+
+  Settle window A quiet period with no author pushes that must elapse before
+                autofix janitors and the archaeologist run.
+
+  Finding       A single item produced by a report-mode janitor, carrying a
+                stable fingerprint.
 
 ---
 
@@ -305,6 +330,30 @@ Two additional roles are defined in core but disabled by default:
     Permissions needed: issues:write only (currently reuses builder App as a pragmatic
     shortcut; splitting to a dedicated App with issues:write only is a recommended TODO).
     See §3.6 for the full planning stage and approval gate specification.
+
+### 4.2.1 Intake Roles (v1.2)
+
+Two additional roles ship with the intake pipeline (§12), enabled when
+`intake.enabled: true` (the default):
+
+  janitor
+    Deterministic cleanup tooling run against wild branches during status:intake.
+    Autofix janitors push tool-generated, semantics-preserving commits under the
+    janitor App identity; report janitors emit check runs and findings. Dedicated
+    GitHub App with a deliberately narrow permission set.
+    Permissions: contents:write, checks:write, pull_requests:write (comments).
+    NO issues:write, NO workflows:write, no review or approval capability.
+    See §12.5 and §12.9.2.
+
+  archaeologist
+    Reconstructs intent from unplanned work. A pure function: diff and context
+    in, one schema-validated JSON payload out. Holds NO GitHub token and has NO
+    App identity — the orchestrator performs every side effect on its behalf.
+    The runner MUST NOT grant it shell execution, network access, or any tool
+    with side effects.
+    Triggers on: status:intake (dispatched by the orchestrator after janitors
+    settle and tripwires pass).
+    See §12.6.
 
 ### 4.3 GitHub App Identity
 
@@ -776,6 +825,875 @@ A deployment is AgentOS-conformant if:
 
 Plugins may extend a conformant deployment without breaking conformance.
 
+When intake is enabled (`intake.enabled: true`, the default), a deployment is
+intake-conformant if additionally:
+  - The intake labels (source:wild, status:intake, status:intake-review, and the
+    three intake follow-on labels) are provisioned
+  - The classifier applies the syntactic classification rule (§12.2) with no
+    heuristic additions
+  - The recursion guard (§12.2.4) is implemented and tested: agent-identity
+    pushes never reset intake state
+  - `pull_request_target` is never combined with a checkout of contributed code
+    anywhere in the intake pipeline (§12.2.6)
+  - The archaeologist runs tokenless with orchestrator-mediated writes (§12.6)
+  - Janitor and archaeologist invocations produce valid run records with
+    identity.role = "janitor" / "archaeologist" (§12.10)
+
+---
+
+## 12. Intake — Unplanned ("Wild") Pull Requests
+
+### 12.1 Purpose and non-goals
+
+agentOS v1.1 is intent-first: an issue exists, a plan is approved, an agent
+produces code, receipts accumulate. Real development includes a second mode: a
+developer (or their local coding agent) produces code first, in their own
+environment, with no issue and no plan. Without intake that work is invisible
+to agentOS — it bypasses the review loop, leaves no receipts, and erodes the
+guarantee that every merged change traces to a documented intent.
+
+**The primary goal of intake is to support developers who push code from their
+own coding environment — with no ceremony at the moment of pushing — while
+keeping that work compatible with a mixed team of humans and agents operating
+the planned lane.** The developer's entire interface is `git push` followed by
+opening a pull request. Everything else is the system's job.
+
+Non-goals:
+
+- **Trust parity with the planned lane.** The planned lane's security property
+  is intent-before-code. Intake structurally lacks it. Wild work is a visibly
+  second-class trust tier by design; `source:wild` never washes off.
+- **Trailing mode** (post-hoc intake for direct-to-main pushes in repositories
+  without branch protection) is deferred. See §12.12.
+- **Stacked-PR decomposition** of oversized wild diffs ("the Splitter") is
+  deferred. See §12.12.
+- Reforming developer behaviour. Intake metabolises unplanned work; it does
+  not discourage it.
+
+### 12.2 Classification
+
+#### 12.2.1 Trigger events
+
+The classifier is a GitHub Actions workflow firing on `pull_request` events:
+`opened`, `reopened`, `ready_for_review`, `synchronize`, and `edited` (base
+branch retarget). The classifier authenticates as the **watcher App** for all
+writes (issue creation, labels, comments). No new App identity is required for
+classification.
+
+#### 12.2.2 The classification rule
+
+A PR is classified **wild** if and only if all of the following hold:
+
+1. The PR author is not an agentOS App identity for this repository.
+2. The PR author is not listed in `intake.exclude_actors`.
+3. The PR has no closing-linked issue (GraphQL `closingIssuesReferences`,
+   which covers closing keywords and sidebar-linked issues).
+
+The rule is deliberately syntactic. Implementations MUST NOT add heuristic
+classification (commit-message quality, diff shape, or model-based guessing).
+Predictability is a feature: a developer can always know, before pushing, how
+the system will treat their branch.
+
+Edge cases (normative resolutions):
+
+- **Bot flood.** Dependabot, Renovate, and similar bots author PRs with no
+  linked issues and non-agent actors. `intake.exclude_actors` MUST default to
+  a maintained list including `dependabot[bot]` and `renovate[bot]`. Excluded
+  actors' PRs are ignored by intake entirely.
+- **Human PR with a linked issue.** This is planned work done manually;
+  archaeology would be redundant and janitor pushes to a deliberately-prepared
+  branch may be unwelcome. Linked PRs are not wild. Default behaviour is
+  `intake.linked_prs: ignore`. Operators MAY set
+  `intake.linked_prs: janitors-report-only` to run the report tier (no pushes,
+  no archaeology) on all human PRs. Autofix on linked PRs is intentionally not
+  offered in v1.2.
+- **PR retargeted to a different base branch.** Classification and all check
+  results are base-relative. On `edited` events that change the base ref, the
+  classifier MUST re-run classification and, if the PR remains wild, reset the
+  stub issue to `status:intake`.
+
+#### 12.2.3 Draft PRs
+
+On a wild **draft** PR, only report-mode janitors run (as check runs). Autofix
+janitors, the archaeologist, and the stub issue MUST all wait for
+`ready_for_review`. Early findings while the developer is still flailing are a
+gift; pushed commits and intent guesses against a moving target are noise and
+cost.
+
+#### 12.2.4 The recursion guard
+
+A janitor push emits a `synchronize` event, which re-fires the classifier,
+which resets intake state, which re-runs janitors, which push again. GitHub's
+built-in Actions loop protection applies only to `GITHUB_TOKEN`, **not** to
+App-token pushes, so this loop is live by default.
+
+The classifier MUST resolve the pushing actor on every `synchronize` event and
+MUST ignore pushes whose actor is any agentOS App identity for the repository.
+Only author (human) pushes reset intake state. This check is normative and
+load-bearing; implementations MUST test it.
+
+#### 12.2.5 Forks
+
+Fork PRs that satisfy §12.2.2 enter the intake lane in **hardened mode**:
+
+- Autofix janitors are disabled regardless of configuration (App tokens cannot
+  push to fork branches; the spec states the policy rather than relying on the
+  platform accident).
+- Report janitors run under GitHub's default fork protections: `pull_request`
+  event, read-only token, no secrets, first-contribution runs require
+  maintainer approval.
+- Author comments do not trigger archaeologist re-runs (§12.6.6).
+
+Intake thereby doubles as a first-time-contributor pipeline: a drive-by OSS
+contribution receives the same facts block, reconstruction, and review path as
+an internal wild PR, at a stricter trust setting.
+
+#### 12.2.6 pull_request_target prohibition
+
+Implementations MUST NOT use `pull_request_target` with a checkout of the
+contributed code anywhere in the intake pipeline.
+
+### 12.3 Label model additions
+
+#### 12.3.1 Source axis
+
+One new value on the existing source axis. Set once at stub-issue creation.
+Never changed, never removed — including after merge.
+
+    Label          Hex Colour   Description
+    -------------  -----------  ------------------------------------------------
+    source:wild    d4c5f9       Issue was created by the intake classifier from
+                                an unplanned pull request.
+
+#### 12.3.2 Status axis
+
+Two new values. Single-select semantics apply as for all status labels: the
+orchestrator removes any existing `status:*` label before applying a new one.
+
+    Label                  Hex Colour   Description
+    ---------------------  -----------  ---------------------------------------
+    status:intake          c5b8f0       Wild PR classified. Janitors running or
+                                        settling; archaeologist queued.
+    status:intake-review   e4d069       Reconstruction written; awaiting
+                                        /approve-intent.
+
+`routes_to` additions:
+
+    labels:
+      status:
+        intake:
+          routes_to: archaeologist   # dispatched by orchestrator after janitors
+                                     # settle and tripwires pass
+        intake-review:
+          routes_to: null            # awaiting human /approve-intent
+
+Wild work joins the existing machine at `status:in-review`. The transitions
+`in-review → approved | changes-requested → merged | closed` are unchanged.
+Hard failures anywhere in intake reuse `status:blocked` with its existing
+semantics. The `plan / plan-review` naming precedent is intentionally
+mirrored: `intake / intake-review` is the same two-stage shape run in the
+opposite temporal direction.
+
+#### 12.3.3 State machine graft
+
+    unplanned PR (ready for review)
+            |
+            |  classifier: create stub issue, closing-link it,
+            |  apply source:wild + status:intake
+            v
+      status:intake ──────────── tripwire or hard finding ────► status:blocked
+            |                                                      (human)
+            |  janitors settle; archaeologist runs;
+            |  reconstruction written to stub body
+            v
+      status:intake-review
+            |
+            |  /approve-intent (must postdate latest push, §12.7.4)
+            v
+      status:in-review ──► existing loop, unchanged
+            |
+            v
+      status:merged / status:closed ──► watcher settlement (§12.8, §12.10)
+
+Any author push while in `status:intake-review` or later (pre-merge) returns
+the stub to `status:intake`. Agent-identity pushes do not (§12.2.4).
+
+A force-push during intake-review is handled identically to any author push —
+reset to `status:intake`, re-run the pipeline. Janitors are idempotent and
+convergent (§12.5.5), so re-running is safe. The `/approve-intent` staleness
+rule (§12.7.4) independently invalidates any approval that predates the push.
+
+#### 12.3.4 Follow-on axis
+
+Three new values, consumed by the watcher at settlement exactly as existing
+follow-on labels are (§12.8):
+
+    follow-on:needs-cleanup           Report-tier lint/format/dead-code findings.
+    follow-on:needs-tests             Characterisation-test work for touched code.
+    follow-on:needs-security-review   Semgrep / dependency-audit findings.
+
+#### 12.3.5 Placement of state
+
+All intake workflow state lives on the **stub issue**, never on the PR. The PR
+carries exactly one piece of intake data: the closing-keyword link in its
+body. This preserves the invariant that the orchestrator mutates labels only
+on issues, and it means watcher settlement works unmodified (merge closes the
+stub via the closing link; the `pull_request.closed` event fires as today).
+
+### 12.4 The stub issue
+
+#### 12.4.1 Creation
+
+On classifying a ready-for-review wild PR, the classifier MUST:
+
+1. Create an issue titled from the PR title (fallback: branch name), body
+   containing the intent markers (empty) and a system notice that the issue is
+   intake-managed.
+2. Apply `source:wild` and `status:intake`. No `type:*` label is applied at
+   creation; the archaeologist proposes one (§12.6.4).
+3. Edit the PR body to prepend `Closes #<stub>` (preserving existing content).
+4. Post a comment on the PR linking the stub and describing what happens next
+   (including the `git pull --rebase` guidance of §12.5.3).
+
+Stub creation MUST be idempotent: if a closing-linked stub already exists
+(reopened PR, classifier re-run), the classifier reuses it.
+
+#### 12.4.2 Ownership and lifecycle
+
+The stub issue is **system-owned from creation until settlement**. Humans
+interact with it through commands (`/approve-intent`, `/request-changes`,
+`/dismiss-findings`) and ordinary comments, not by editing its labels or body.
+
+- **Stub closed manually mid-intake:** while the linked PR is open, the
+  classifier MUST reopen a manually-closed stub and post a comment explaining
+  system ownership and pointing at the PR-close path for cancelling the work.
+  Closing the **PR** is the supported cancellation: the watcher settles the
+  stub with `outcome=cancelled`.
+- **PR reopened after cancellation:** the classifier finds the existing
+  closing-linked stub, reopens it, and resets it to `status:intake`. A fresh
+  settlement record is written at the eventual terminal state. Metrics
+  consumers MUST tolerate multiple settlement records per issue with the
+  latest being authoritative.
+
+#### 12.4.3 Body structure
+
+The stub body after reconstruction contains, in order: the system notice, the
+facts block, the interpretation between the existing
+`<!-- AGENTOS:PLAN:BEGIN -->` / `<!-- AGENTOS:PLAN:END -->` markers, and the
+janitor summary. Reusing the PLAN markers is deliberate: every issue body has
+one canonical location for its intent document, and `source:*` disambiguates
+whether intent preceded code (planned) or was inferred from it (wild).
+
+### 12.5 The janitor layer
+
+#### 12.5.1 The tier criterion
+
+At intake time there is generally no behavioural oracle: wild branches
+typically carry no tests, no reviewed intent, no baseline. Therefore the
+boundary between what a janitor may fix and what it may only report cannot be
+confidence-based. It is capability-based.
+
+A janitor MAY run in **autofix** mode only if its transformation is:
+
+1. **Deterministic** — tool-generated; same input produces same output; no
+   LLM anywhere in the path.
+2. **Semantics-preserving by construction** — AST-equivalent or purely
+   lexical transforms. "Probably fine" transforms do not qualify; where a
+   tool classifies its own fixes (ruff, ESLint), only the safe class is
+   permitted.
+3. **Idempotent** — a second run over its own output is a no-op.
+
+Everything else is **report** mode. The normative one-line trust story:
+*if an agent pushed it, its harmlessness was provable from syntax; if judgment
+was required, it went through review.*
+
+#### 12.5.2 The three tiers
+
+**Autofix (pushes commits):** code formatting, import sorting,
+whitespace/EOL/EditorConfig conformance, license headers, codegen
+regeneration, lockfile-to-manifest synchronisation.
+
+**Report (check runs + facts block):** static-analysis findings (semgrep),
+secret detection, dependency CVE and license audit, type errors, lint rules
+without safe fixes, dead-code detection, missing-test detection, TODO/FIXME
+inventory, oversized-binary detection.
+
+**Not janitors (excluded from intake):** refactoring, docstring or
+documentation generation, test writing, error-handling improvements, debug
+statement removal — any transformation requiring an LLM or judgment. These
+are builder work after intent approval, or follow-on issues at settlement
+(§12.8). Running agentic "cleanup" during intake would burn tokens on
+possibly-rejected intent and contaminate the diff the human is about to
+approve.
+
+Security findings are report-tier **categorically**: a janitor MUST NOT apply
+autofixes offered by a security tool. A patched-over vulnerability the human
+never saw is worse than a loud finding.
+
+#### 12.5.3 Execution model
+
+Janitors run serially, in the order declared in configuration, inside a
+GitHub Actions job triggered from `status:intake`, after tripwires (§12.6.2)
+and after the settle window elapses:
+
+- `intake.settle_seconds` (default 300): autofix janitors and the
+  archaeologist MUST NOT start until no author push has occurred for this
+  window. Report-mode checks MAY run immediately on every push.
+
+A janitor MAY declare `block_on: critical` or `block_on: any`: if findings
+at or above that severity exist after the run, the stub is routed to
+`status:blocked` before the archaeologist dispatches. The `secrets` janitor
+(§12.5.7) always blocks regardless of this field.
+
+A `paths:` ratchet overrides the global janitor mode for files matching a
+glob path. Example: `"legacy/**": {janitors_mode: report}` keeps legacy
+code report-only even when the global mode is `autofix`.
+
+The race between janitor pushes and the developer's continued local work is
+the single most likely cause of a developer disabling the feature. Three
+layers address it: (a) the settle window keeps janitors off actively-moving
+branches; (b) any author push during or after janitor runs resets to
+`status:intake`; janitors re-run and re-converge — idempotency makes this
+safe; (c) documentation MUST prominently instruct `git pull --rebase` as the
+wild-lane norm, and the classifier's first PR comment (§12.4.1) includes this
+line. Operators who still find pushes too intrusive can set every janitor to
+`mode: report`.
+
+#### 12.5.4 Commit discipline
+
+Each autofix janitor that changes anything pushes **its own commit** under the
+**janitor App identity** with a trailer:
+
+    AgentOS-Janitor: <name>
+    AgentOS-Run-Id: <run id>
+
+Janitors MUST NOT amend, squash, or force-push, and MUST NOT modify commits
+authored by anyone else. Attribution is structural: every janitor-written line
+is signed by an App that, by permission table (§12.9.2), cannot review,
+approve, or push to protected branches.
+
+#### 12.5.5 Convergence
+
+After the full janitor sequence completes, the sequence MUST run a second
+time and produce an empty diff. If it does not converge by
+`intake.convergence_passes` (default 2):
+
+1. All janitor commits from this intake cycle are reverted (one revert
+   commit, janitor-attributed).
+2. Every autofix janitor is demoted to report mode for this PR.
+3. An issue is filed against the operator's janitor configuration
+   (`type:bug`, `source:agent-created`) — dueling formatters are a config
+   defect, not a per-PR event.
+
+#### 12.5.6 The test oracle
+
+If the repository has a test suite (`intake.test_oracle: auto`):
+
+- Run it against the author's head commit before any autofix.
+- Run it again after janitors converge.
+- **pass → pass:** proceed.
+- **pass → fail:** revert all janitor commits, demote the janitor set to
+  report mode for this PR, and file a config issue — by the tier criterion,
+  any autofix that changes test results was mis-tiered. Self-demotion turns
+  tier mistakes into filed bugs instead of shipped breakage.
+- **fail baseline:** there is no oracle; proceed on the syntactic-safety
+  criterion alone and record `oracle: none` in the facts block.
+
+Empty or merge-commit-only diffs: skip janitors, write a facts-only
+reconstruction with `confidence: low`, proceed to `status:intake-review`.
+The human gate still applies.
+
+#### 12.5.7 Secrets
+
+Secret detection findings receive the strictest report handling: the PR is
+routed to `status:blocked`, and the report MUST demand **rotation**, not
+removal — a secret pushed to any remote is already burned; deleting it from
+the branch tip does nothing about history. The janitor MUST NOT attempt
+history rewriting.
+
+### 12.6 The archaeologist
+
+#### 12.6.1 Role definition
+
+The archaeologist reconstructs intent from unplanned work. It is the first
+agentOS role whose entire input is untrusted by design, and its contract is
+correspondingly stricter than any existing role: it is a **pure function** —
+diff and context in, one JSON payload out. It holds no GitHub token. The
+orchestrator performs every side effect on its behalf.
+
+The rationale is a gap App scoping cannot close: GitHub permissions are not
+row-level. An `issues:write` token can edit any issue in the repository. A
+hijacked archaeologist holding such a token could rewrite approved plans on
+unrelated issues. Mediated writes reduce its fully-hijacked blast radius to a
+misleading string rendered inside a template, adjacent to deterministic
+facts, read by a human.
+
+#### 12.6.2 Tripwires precede everything
+
+Before janitors or archaeologist run, the orchestrator evaluates
+`intake.tripwire_paths` against the diff's file list (deterministically —
+no model involved). Defaults:
+
+    .github/workflows/**
+    .github/actions/**
+    agentOS.yaml
+    .agentOS/**
+
+Any match routes the stub to `status:blocked` immediately: no reconstruction,
+no autofix, human eyes mandatory. This rule also severs a downstream hazard:
+the builder holds `workflows:write`, so a wild `changes-requested` cycle
+(§12.9) must never begin on a diff that touches workflow definitions.
+
+#### 12.6.3 Inputs
+
+- The diff, PR title, branch name, and commit messages — delimited and
+  declared untrusted data in the runner prompt contract.
+- Read-only repository context (surrounding code).
+- The orchestrator-computed facts block and janitor results, provided as
+  ground truth the archaeologist MAY reference and MUST NOT restate with
+  alterations.
+
+The archaeologist runner MUST NOT be granted shell execution, network access,
+or any tool with side effects. URLs appearing in the diff are data, never
+fetch targets.
+
+#### 12.6.4 Output contract
+
+One JSON payload, schema-validated by the orchestrator before any GitHub
+write occurs:
+
+    {
+      "interpretation": "string — what this change appears to be trying to do",
+      "confidence": "high | medium | low",
+      "proposed_type": "feature | bug | chore | docs",
+      "scope": ["string — files/behaviours this change legitimately covers"],
+      "proposed_title": "string — replaces branch-name garbage on the stub",
+      "questions": ["string — asked of the author when confidence < high"]
+    }
+
+Schema violations are treated as a failed run (existing runner exit-code
+semantics); the orchestrator retries once, then routes to `status:blocked`.
+
+The `scope` array becomes the reviewer's reference for
+`review:scope-violation` — the first time that flag has defined meaning for
+unplanned work. Note the defence-in-depth assumption: a deceived
+archaeologist could write a generous scope, which is why the reviewer's
+`review:security-concern` check is scope-independent and why the facts block
+lists touched surfaces regardless of anything the model says.
+
+#### 12.6.5 What the orchestrator does with the payload
+
+Assembles facts + interpretation into the stub body between the intent
+markers (interpretation explicitly captioned as machine-inferred), applies
+`type:<proposed_type>`, sets the stub title, transitions to
+`status:intake-review`, posts the intake-review comment (§12.7), and writes
+the standard JSONL run record with `role: "archaeologist"`.
+
+#### 12.6.6 Re-runs, corrections, and cost caps
+
+- Any author push (post-settle-window) re-dispatches the archaeologist with
+  the updated diff. Concurrency group keyed on the stub issue number, as for
+  the planner.
+- For same-repo authors, a reply to the archaeologist's questions
+  re-dispatches with the reply included as high-weight context — a one-line
+  answer from the person who wrote the code beats any amount of diff
+  archaeology.
+- For fork authors, replies MUST NOT trigger re-runs (spam and injection
+  vector); a maintainer comment MAY.
+
+Cost caps, all configurable:
+
+    intake.max_diff_lines   (default 6000)  Above this, skip interpretation
+                                            entirely: facts-only reconstruction,
+                                            confidence pinned to low.
+    intake.max_recon_runs   (default 5)     Per stub. Beyond it, facts-only
+                                            mode; a human reads the diff.
+
+Binary-only or generated-only diffs: facts-only reconstruction,
+`confidence: low`, questions to the author auto-populated ("describe what
+this changes").
+
+### 12.7 The intake-review comment and /approve-intent
+
+#### 12.7.1 The comment is the security boundary
+
+The intake-review comment is what a human reads before approving. Its
+information ordering is normative, not stylistic:
+
+1. **Facts** (computed): files and surfaces touched, LOC delta, dependency
+   delta, oracle status, janitor findings summary with check-run links.
+2. **Commit provenance:** author commits and janitor commits, listed
+   separately.
+3. **Direct link to the PR's Files changed view.**
+4. **Interpretation**, visibly captioned: *"Inferred by the archaeologist —
+   verify against the diff."* Confidence shown. Questions to the author, if
+   any.
+5. **Actions:** `/approve-intent`, `/request-changes <notes>`,
+   `/dismiss-findings <category> --reason <text>`.
+
+Facts before interpretation, always. The design intent is that a
+rubber-stamping human is rubber-stamping computed facts, not model prose.
+
+#### 12.7.2 What /approve-intent asserts
+
+The approver asserts that (a) the interpretation matches the actual intent of
+the work, and (b) they have seen the facts block. It does **not** assert code
+correctness — that remains the review stage's job. The command is available
+to the same authoriser set as `/approve-plan` (permission verified live at
+dispatch, per the existing pattern) and SHOULD be implemented as an alias
+into the same handler.
+
+#### 12.7.3 Author-approver identity
+
+The PR author MAY be the approver only if they hold the authoriser role;
+operators on mixed teams SHOULD require a second person for wild work via
+`intake.approve_intent_self: false` (default `true` for solo operators, set
+explicitly by `agentOS init` according to repo collaborator count).
+
+#### 12.7.4 Staleness
+
+An `/approve-intent` is valid only if its timestamp postdates the latest push
+to the PR branch — author or janitor. This reuses the existing
+approval-postdates-plan ordering check verbatim. Combined with §12.3.3's
+reset-on-author-push rule, a developer who keeps YOLOing after approval
+automatically invalidates that approval.
+
+If `/approve-intent` and a `git push` land within seconds of each other, the
+ordering check is evaluated by the orchestrator at dispatch time against
+GitHub's recorded timestamps, exactly as `/approve-plan` is today. Ties or
+out-of-order delivery resolve to "approval invalid; re-approve after the
+branch settles," and the orchestrator comments to say so.
+
+### 12.8 Report-to-work
+
+#### 12.8.1 Filing is the default; nothing decays silently
+
+Report findings are filed as work automatically; the alternative to fixing is
+**dismissing**, and dismissal is a first-class recorded act.
+
+During intake, the orchestrator maps report categories onto the follow-on
+axis on the stub (§12.3.4). At settlement — merge, not approval — the watcher
+does exactly what it does today: one fresh issue per follow-on label, linking
+back to the stub, carrying the full findings report, entering the **planned
+lane** (`source:agent-created`, plan gate per governance, builder, reviewer,
+human merge). The wild taint does not propagate: delegated cleanup passes
+through every gate the original PR skipped.
+
+Filing at settlement rather than approval is deliberate: findings against an
+unmerged PR are hypothetical; findings against merged code are debt. A wild
+PR closed without merge takes its findings to the grave, recorded as
+`outcome=cancelled`, and no orphaned cleanup issues are created.
+
+#### 12.8.2 Deduplication
+
+Findings carry stable fingerprints (semgrep's native fingerprints; a
+tool+rule+path+normalised-location hash otherwise). Before spawning, the
+watcher checks open cleanup issues: repeat findings append a linking comment
+to the existing issue rather than filing a duplicate. Granularity is one
+issue per category per settlement ("41 lint findings from PR #212"), not one
+per finding. If an open cleanup issue exists for the same category and
+path-scope, the watcher appends to it instead of filing anew — three YOLO PRs
+into the same messy module must not triple the backlog.
+
+#### 12.8.3 Dismissal
+
+Posted on the cleanup issue (or the stub before settlement) by an authoriser.
+The watcher records actor, timestamp, category, and reason in the settlement
+record. Undismissed, unfixed findings remain open issues on the board —
+visible, ageing, and countable. The failure mode this exists to prevent is
+findings rotting in CI logs nobody opens.
+
+#### 12.8.4 Per-category configuration
+
+    intake:
+      reports:
+        lint:     {file: auto, start: auto}
+        tests:    {file: auto, start: auto}     # characterisation tests
+        security: {file: auto, start: manual}
+        deps:     {file: auto, start: manual}
+
+`start: auto` applies `status:todo` on the spawned issue (which still passes
+the planned lane's own approval gates); `start: manual` files it visibly and
+leaves launch timing to a human. Security defaults to manual launch: filing
+is safe; auto-dispatching a builder against a security finding is where a
+human should choose the moment.
+
+### 12.9 Provenance-weighted governance
+
+`source:*` labels already adjust orchestrator behaviour
+(`auto_start_agent_issues`); intake extends the same pattern. For issues
+carrying `source:wild`, downstream defaults are stricter and MUST be
+overridable only explicitly:
+
+    governance:
+      wild:
+        auto_merge: false            # regardless of repo default
+        final_approval: human        # a human merges, always
+        max_review_cycles: 2         # tighter than the planned default of 3
+        changes_requested_routes_to: builder   # builder | author
+
+`changes_requested_routes_to: builder` means an agent iterates on the human's
+wild code in response to review comments — for the developer who chose YOLO
+mode, delegated iteration is usually the revealed preference. The `author`
+setting instead posts the review to the PR and waits for a human push. Note
+that §12.6.2's tripwire has already excluded workflow-touching diffs from
+ever reaching a builder cycle.
+
+**Admin force-merge bypassing gates:** the platform permits an admin to merge
+a wild PR before `/approve-intent` or review completes; the spec cannot
+prevent it. The resolution is observability instead of prevention — the
+watcher detects unsatisfied gates at settlement and records
+`gates_bypassed: true` with the merging actor in the settlement record. The
+dashboard surfaces the count.
+
+#### 12.9.1 Threat model
+
+Three archaeologist failure modes and their containment:
+
+- **Deception** (prompt injection via diff content): an attacker embeds
+  instructions in the diff, commit messages, or file content, attempting to
+  cause the archaeologist to produce a misleading reconstruction that a
+  human approves. Mitigated by: (a) the computed facts block is independent
+  of anything the model says — file list, LOC delta, dependency changes are
+  enumerated before the model runs; (b) the facts-first comment ordering is
+  normative (§12.7.1); (c) tripwires exclude the highest-risk diffs from the
+  pipeline entirely (§12.6.2); (d) `review:security-concern` is
+  scope-independent — the reviewer checks for security issues regardless of
+  the scope the archaeologist declared.
+
+- **Hallucination** (fabricated intent in the audit trail): the archaeologist
+  invents a plausible-sounding interpretation that doesn't match the diff.
+  Mitigated by: the author-confirmation loop (`questions` field, reply
+  re-dispatch for same-repo authors), the `confidence` field surfaced
+  prominently, and `source:wild` permanently marking the reconstruction as
+  machine-inferred rather than human-stated intent.
+
+- **Hijack** (side effects under agent credentials): a compromised
+  archaeologist attempts to perform side effects beyond writing its JSON
+  payload. Mitigated by the pure-function contract: no token, no shell
+  execution, no network access. Every write is mediated by the orchestrator
+  after schema-validating the payload. The fully-hijacked blast radius is a
+  misleading string rendered inside a template, adjacent to deterministic
+  facts, read by a human before any code runs.
+
+#### 12.9.2 App permission delta
+
+One new App: **janitor**.
+
+    Permission       Level    Reason
+    ---------------  -------  -------------------------------------------
+    contents         write    Push autofix commits to wild PR branches
+    checks           write    Report findings as check runs
+    pull_requests    write    Comment on PRs (findings summaries)
+    metadata         read     Required by all Apps
+
+The janitor App holds no `issues`, `workflows`, or `actions` permissions.
+It cannot review, approve, label, or touch protected branches.
+
+The **archaeologist has no App identity** — it holds no token and performs
+no writes. `contents:read` for context is its ceiling; mediated writes are
+the only path to any GitHub state change.
+
+#### 12.9.3 Workflow execution posture
+
+Running repo-configured janitor commands against wild code is code execution.
+For same-repo authors this is the standing trust already extended to
+collaborators. For forks, GitHub's `pull_request` protections apply (§12.2.5).
+In all cases:
+
+- Janitor jobs MUST NOT receive repository secrets beyond the janitor App key.
+- Intake workflows MUST NOT use `pull_request_target` with a checkout of
+  contributed code (§12.2.6).
+- The recursion guard (§12.2.4) is restated here as a security property:
+  unguarded, it is also a cost-amplification attack vector.
+
+#### 12.9.4 Residual risks (accepted, documented)
+
+- A deceived archaeologist writes a plausible-but-wrong interpretation; a
+  hurried human approves it. Mitigated by facts-first ordering and staleness
+  rules; not eliminated. This is the residual risk of *any* human-approval
+  system.
+- Autofix janitors run tool binaries from the repo's own toolchain
+  configuration; a malicious lockfile could theoretically weaponise a
+  formatter. Partially mitigated by pinned tool versions in the intake
+  workflow definition; full supply-chain hardening is out of scope for v1.2.
+
+#### 12.9.5 Explicitly rejected alternatives
+
+Post-hoc plan fabrication (writing reconstruction as if it were a plan,
+without `source:wild`) — rejected because provenance laundering breaks the
+audit trail's core guarantee. LLM-based classification — rejected for
+unpredictability (§12.2.2). Archaeologist with direct GitHub writes —
+rejected (§12.6.1). Janitor autofix for security findings — rejected
+(§12.5.2, §12.5.7).
+
+### 12.10 Receipts and metrics
+
+#### 12.10.1 Run records
+
+Janitor batches and archaeologist runs write standard JSONL run records.
+
+`role: "janitor"` records carry one event per janitor tool per intake cycle:
+
+    "intake": {
+      "tools": [
+        {"name": "format",  "mode": "autofix", "commit_sha": "abc123", "findings": 0},
+        {"name": "semgrep", "mode": "report",  "commit_sha": null,     "findings": 2}
+      ],
+      "findings_by_category": {"lint": 41, "security": 2},
+      "convergence_passes": 1,
+      "oracle": "pass"    // pass | fail | none (no baseline suite)
+    }
+
+`total_cost_usd: 0.0` is written explicitly for every janitor record —
+deterministic tools are free, and the corpus should say so rather than
+omit them.
+
+`role: "archaeologist"` records carry:
+
+    "intake": {
+      "confidence": "medium",
+      "proposed_type": "feature",
+      "diff_lines": 412,
+      "facts_only": false    // true when max_diff_lines/max_recon_runs hit
+    }
+
+#### 12.10.2 Settlement record additions
+
+Wild settlement records carry the following additional fields:
+
+    "source": "wild",
+    "intake": {
+      "intake_cycles":       2,          // count of status:intake transitions
+      "janitor_commits":     3,
+      "findings_filed":      {"lint": 41, "security": 2},
+      "findings_dismissed":  [{"category": "lint", "actor": "...",
+                               "reason": "...", "ts": "..."}],
+      "recon_confidence":    "medium",
+      "gates_bypassed":      false,      // true + merging actor if admin force-merged
+      "oracle":              "pass"      // pass | none | reverted
+    }
+
+Metrics consumers MUST tolerate multiple settlement records per issue (a
+wild PR cancelled and later reopened, then merged — §12.4.2); the latest
+is authoritative.
+
+#### 12.10.3 Derived metrics
+
+Named here so dashboards converge on shared definitions:
+
+- **Wild share** — wild merges / all merges.
+- **Wild-debt ratio** — cleanup issues spawned per wild merge.
+- **Cleanup half-life** — median time from filing to close of spawned issues.
+- **Dismissal rate** — dismissed / (dismissed + fixed), per category.
+- **Intake overhead** — median archaeologist cost + wall-clock per wild merge.
+
+Together these answer the question every engineering lead will ask: *what
+does YOLO mode actually cost us?* The planned and wild lanes are comparable
+from the same corpus with zero new instrumentation.
+
+#### 12.10.4 Edge case — label collision on provisioning
+
+A target repo already carries a label named `status:intake` from prior
+tooling. The existing upsert contract (§3.5) applies unchanged: colour and
+description are updated to spec values; `agentOS apply` reports the update.
+
+### 12.11 Configuration reference
+
+The full `intake:` block with defaults:
+
+    intake:
+      enabled: true
+      exclude_actors: ["dependabot[bot]", "renovate[bot]"]
+      linked_prs: ignore                 # ignore | janitors-report-only
+      settle_seconds: 300
+      convergence_passes: 2
+      test_oracle: auto                  # auto | off
+      max_diff_lines: 6000
+      max_recon_runs: 5
+      model: null                        # archaeologist model; null = orchestrator default
+      approve_intent_self: true          # set by init from collaborator count
+      tripwire_paths:
+        - ".github/workflows/**"
+        - ".github/actions/**"
+        - "agentOS.yaml"
+        - ".agentOS/**"
+      janitors:
+        - name: format
+          run: "<tool command>"
+          mode: report                   # autofix | report | off
+          # block_on: critical           # optional: route to blocked on critical findings
+        - name: semgrep
+          run: "semgrep --config auto"
+          mode: report
+          block_on: critical
+        - name: secrets
+          run: "<secret-scanner>"
+          mode: report
+          block_on: any                  # secrets always block; not configurable downward
+      paths:                             # per-path mode ratchet (optional)
+        # "legacy/**":    {janitors_mode: report}
+        # "generated/**": {janitors_mode: off}
+      forks:
+        autofix: false                   # normative; not configurable upward
+      reports:
+        lint:     {file: auto, start: auto}
+        tests:    {file: auto, start: auto}
+        security: {file: auto, start: manual}
+        deps:     {file: auto, start: manual}
+
+    governance:
+      wild:
+        auto_merge: false
+        final_approval: human
+        max_review_cycles: 2
+        changes_requested_routes_to: builder
+
+`agentOS init` MUST ship this block with `enabled: true` and every janitor in
+`mode: report`. Report-only is behaviourally invisible (no pushes, no diff
+mutations) while still exercising classification, stub creation, archaeology,
+and the human gate — the correct first-contact posture. Operators graduate
+janitors to autofix per-tool.
+
+### 12.12 Deferred features
+
+    Trailing mode (direct-to-main intake)   Requires solving attribution and
+                                            settlement for already-merged
+                                            commits; revisit with field data
+                                            from v1.2.
+
+    The Splitter (stacked-PR decomposition) High value for oversized wild
+                                            diffs; blocked on reliable
+                                            semantic diff chunking.
+                                            max_diff_lines + facts-only mode
+                                            is the v1.2 answer.
+
+    Autofix on linked (planned-manual) PRs  Deliberately withheld; janitor
+                                            pushes to deliberately-prepared
+                                            branches are unwelcome until
+                                            requested.
+
+### 12.13 Open questions
+
+1. **Source axis openness.** Intake added `source:wild` to core rather than
+   as a plugin axis value, because the planned/wild distinction is
+   first-class routing logic, not an operator concern. The next integrator
+   will want `source:alert` (webhook-originated) or `source:import`. Should
+   the `source` axis be opened to plugin value-additions? Deferred pending
+   a concrete plugin deployment that needs it.
+
+2. **Risk-acknowledged approval.** Should facts that cross a threshold (e.g.
+   a new dependency, a secrets-adjacent path) require
+   `/approve-intent --ack-risk` rather than plain approval, making the
+   reviewer explicitly confirm they read the flags? Deferred pending
+   real intake-review comment usage data; the facts block already surfaces
+   the signals.
+
+3. **Suggestion-mode autofix.** GitHub review suggestions instead of janitor
+   commits would eliminate the push-race (§12.5.3) entirely at the cost of
+   one click per fix. Worth prototyping if the settle-window mitigations
+   prove insufficient in practice.
+
 ---
 
 ## Appendix A: Colour Reference
@@ -785,6 +1703,8 @@ the routing logic is based on label names, not colours.
 
   status:plan              c5def5   Light blue (planner entry)
   status:plan-review       e4e669   Yellow (awaiting approval)
+  status:intake            c5b8f0   Light purple (wild PR classified; janitors/archaeologist)
+  status:intake-review     e4d069   Yellow (awaiting /approve-intent)
   status:todo              ededed   Light gray
   status:in-progress       0075ca   Blue
   status:in-review         fbca04   Yellow
@@ -799,6 +1719,8 @@ the routing logic is based on label names, not colours.
   agent:docs               5319e7   Purple
   agent:watcher            0075ca   Blue
   agent:planner            f9d0c4   Salmon
+  agent:janitor            c2e0c6   Light green
+  agent:archaeologist      d4c5f9   Light purple
 
   type:feature             84b6eb   Light blue
   type:bug                 ee0701   Red
@@ -809,6 +1731,11 @@ the routing logic is based on label names, not colours.
 
   source:agent-created     0e8a16   Green
   source:human-created     bfd4f2   Light blue
+  source:wild              d4c5f9   Light purple (intake classifier; see §12)
+
+  follow-on:needs-cleanup           fef2c0   Cream (intake report findings)
+  follow-on:needs-tests             fef2c0   Cream (characterisation tests)
+  follow-on:needs-security-review   b60205   Dark red (security findings)
 
 ---
 

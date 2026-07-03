@@ -3,12 +3,12 @@
 # Human-readable, git-diffable, versioned.
 #
 # Import this file into your project with:
-#   agentOS init --from github:open-agentos/agentos@v1.1.0
+#   agentOS init --from github:open-agentos/agentos@v1.2.0
 #
 # Then provision your repository with:
 #   agentOS apply --repo owner/my-repo
 
-specVersion: "1.1"
+specVersion: "1.2"
 specId: "github-agentOS"
 
 metadata:
@@ -110,6 +110,35 @@ agents:
       - status:plan
     branch_prefix: ""           # Planner does not open branches
 
+  - id: janitor
+    description: >
+      Deterministic cleanup tooling run against wild branches during
+      status:intake (SPEC.md §12.5). Autofix janitors push tool-generated,
+      semantics-preserving commits under this App identity; report janitors
+      emit check runs and findings. Deliberately narrow permission set:
+      NO issues:write, NO workflows:write, no review or approval capability
+      (SPEC.md §12.9.2).
+    create_app: true
+    permissions:
+      contents: write           # Push janitor commits to wild PR branches
+      checks: write             # Publish report-tier findings as check runs
+      pull_requests: write      # Comment on PRs (findings summaries)
+      metadata: read
+    triggers: []                # Invoked by the intake workflow, not labels
+    branch_prefix: ""           # Janitors push to the author's branch, never their own
+
+  - id: archaeologist
+    description: >
+      Reconstructs intent from unplanned ("wild") pull requests (SPEC.md §12.6).
+      A pure function: diff and context in, one schema-validated JSON payload
+      out. Holds NO GitHub token and has NO App identity — the orchestrator
+      performs every side effect on its behalf. The runner MUST NOT grant it
+      shell execution, network access, or any tool with side effects.
+    create_app: false           # Intentionally no App: mediated writes only
+    triggers:
+      - status:intake           # Dispatched after janitors settle and tripwires pass
+    branch_prefix: ""           # Archaeologist does not open branches
+
 # ============================================================
 # RUNTIME
 # The runner command is the CLI tool that executes agents.
@@ -156,6 +185,121 @@ governance:
   # The planner MUST replace content between these markers on each run (never append).
   plan_begin_marker: "<!-- AGENTOS:PLAN:BEGIN -->"
   plan_end_marker: "<!-- AGENTOS:PLAN:END -->"
+
+  # Provenance-weighted governance for wild work (SPEC.md §12.9).
+  # Issues carrying source:wild get stricter downstream defaults; each
+  # field is overridable only explicitly.
+  wild:
+    auto_merge: false                       # Regardless of repo default
+    final_approval: human                   # A human merges, always
+    max_review_cycles: 2                    # Tighter than the planned default of 3
+    changes_requested_routes_to: builder    # builder | author
+
+# ============================================================
+# INTAKE
+# The unplanned ("wild") PR pipeline: classification, stub
+# issues, janitors, the archaeologist, and /approve-intent.
+# See SPEC.md §12. Shipped enabled with every janitor in
+# report mode — behaviourally invisible (no pushes) while
+# still exercising classification and the human gate.
+# ============================================================
+intake:
+  enabled: true
+
+  # PR authors ignored by intake entirely (bot flood guard, SPEC.md §12.2.2).
+  exclude_actors: ["dependabot[bot]", "renovate[bot]"]
+
+  # Human PRs with a closing-linked issue are planned work done manually.
+  # ignore                — intake does not touch them (default)
+  # janitors-report-only  — run report-tier janitors (no pushes, no archaeology)
+  linked_prs: ignore
+
+  # Quiet period (seconds, no author pushes) before autofix janitors and
+  # the archaeologist run. Report-mode checks may run immediately.
+  settle_seconds: 300
+
+  # Max full janitor-sequence passes before declaring non-convergence:
+  # revert all janitor commits, demote to report mode, file a config bug.
+  convergence_passes: 2
+
+  # auto — run the repo test suite before/after autofix as a behavioural
+  #        oracle (pass→fail reverts and demotes). off — skip.
+  test_oracle: auto
+
+  # Above this diff size, skip interpretation: facts-only reconstruction,
+  # confidence pinned to low.
+  max_diff_lines: 6000
+
+  # Max archaeologist runs per stub; beyond it, facts-only mode.
+  max_recon_runs: 5
+
+  # Archaeologist model override; null = orchestrator default.
+  model: null
+
+  # May the PR author approve their own intent (if they hold the authoriser
+  # role)? Set false on mixed teams to require a second person.
+  # `agentOS init` sets this from repo collaborator count.
+  approve_intent_self: true
+
+  # Deterministic path rules evaluated against the diff's file list before
+  # any agent runs. Any match routes the stub to status:blocked (SPEC.md §12.6.2).
+  tripwire_paths:
+    - ".github/workflows/**"
+    - ".github/actions/**"
+    - "agentOS.yaml"
+    - ".agentOS/**"
+
+  # Janitor sequence, run serially in declared order (SPEC.md §12.5).
+  # mode: autofix — pushes tool-generated, semantics-preserving commits
+  #       report  — check runs + findings only (no pushes)
+  #       off     — disabled
+  # block_on: critical — route stub to status:blocked if critical findings
+  #           any      — block on any findings; omit to never block on this janitor
+  # Security tools are report-only, always: a janitor MUST NOT apply
+  # autofixes offered by a security tool (SPEC.md §12.5.2).
+  # init posture: every janitor ships in report mode; operators graduate
+  # individual tools to autofix once trusted.
+  #
+  # Example fully-configured operator stack (uncomment and adjust modes):
+  # janitors:
+  #   - {name: format,  run: "ruff format .",               mode: autofix}
+  #   - {name: imports, run: "ruff check --select I --fix", mode: autofix}
+  #   - {name: lint,    run: "ruff check",                  mode: report}
+  #   - {name: semgrep, run: "semgrep ci",                  mode: report, block_on: critical}
+  #   - {name: secrets, run: "gitleaks detect",             mode: report, block_on: any}
+  #   - {name: deps,    run: "pip-audit",                   mode: report}
+  janitors:
+    - name: format
+      run: "<tool command>"     # e.g. "ruff format ." or "prettier --write ."
+      mode: report
+    - name: semgrep
+      run: "semgrep --config auto"
+      mode: report
+
+  # Per-path janitor mode ratchet (optional). Glob keys override the
+  # global janitor mode for files matching that path. Use to keep legacy
+  # or generated directories report-only even when global mode is autofix.
+  # Example:
+  # paths:
+  #   "legacy/**":    {janitors_mode: report}
+  #   "generated/**": {janitors_mode: off}
+
+  # Fork-specific overrides (SPEC.md §12.2.5).
+  # autofix is always false on forks — the spec states this as policy, not
+  # as a platform accident. Not configurable upward.
+  forks:
+    autofix: false
+
+  # Report-to-work: how report findings become follow-on issues at
+  # settlement (SPEC.md §12.8.4).
+  # file:  auto — file an issue per category at settlement
+  # start: auto — apply status:todo on the spawned issue (still passes the
+  #        planned lane's approval gates); manual — file visibly, human launches.
+  reports:
+    lint:     {file: auto, start: auto}
+    tests:    {file: auto, start: auto}
+    security: {file: auto, start: manual}
+    deps:     {file: auto, start: manual}
 
 # ============================================================
 # LABELS
@@ -209,6 +353,16 @@ labels:
         description: "Plan written into body; awaiting admin /approve-plan"
         routes_to: null           # No agent; human approval required
 
+      - name: intake
+        color: "c5b8f0"
+        description: "Wild PR classified; janitors running or settling; archaeologist queued"
+        routes_to: archaeologist  # Dispatched after janitors settle and tripwires pass
+
+      - name: intake-review
+        color: "e4d069"
+        description: "Reconstruction written; awaiting /approve-intent"
+        routes_to: null           # No agent; human approval required
+
       - name: done
         color: "0e8a16"
         description: "Issue resolved; terminal state"
@@ -237,6 +391,14 @@ labels:
       - name: planner
         color: "f9d0c4"
         description: "Planner agent is the current owner"
+
+      - name: janitor
+        color: "c2e0c6"
+        description: "Janitor tooling is running on the linked wild PR"
+
+      - name: archaeologist
+        color: "d4c5f9"
+        description: "Archaeologist is reconstructing intent for this stub"
 
   # ---- TYPE AXIS — ISSUE CLASSIFICATION ----
   - axis: type
@@ -279,6 +441,10 @@ labels:
         color: "bfd4f2"
         description: "Created by a human"
 
+      - name: wild
+        color: "d4c5f9"
+        description: "Created by the intake classifier from an unplanned pull request"
+
   # ---- FOLLOW-ON AXIS — ASYNC HANDOFF SIGNALS ----
   # Routes_to is configurable. Null = informational only.
   # Set routes_to to a role id to trigger that agent when the label is applied.
@@ -289,6 +455,21 @@ labels:
         color: "fef2c0"
         description: "Documentation should be updated as a follow-on action"
         routes_to: null           # Set to "docs" to auto-trigger docs agent
+
+      - name: needs-cleanup
+        color: "fef2c0"
+        description: "Report-tier lint/format/dead-code findings from intake"
+        routes_to: null           # Consumed by watcher at settlement (SPEC.md §12.8)
+
+      - name: needs-tests
+        color: "fef2c0"
+        description: "Characterisation-test work for code touched by a wild PR"
+        routes_to: null           # Consumed by watcher at settlement (SPEC.md §12.8)
+
+      - name: needs-security-review
+        color: "b60205"
+        description: "Semgrep / dependency-audit findings from intake"
+        routes_to: null           # Consumed by watcher at settlement (SPEC.md §12.8)
 
 # ============================================================
 # BOARD
@@ -321,6 +502,10 @@ board:
           color: PURPLE
         - name: Planner
           color: PINK
+        - name: Janitor
+          color: GREEN
+        - name: Archaeologist
+          color: PURPLE
 
     - name: Agent Status
       type: single_select
@@ -345,6 +530,10 @@ board:
         - name: Plan
           color: BLUE
         - name: Plan review
+          color: YELLOW
+        - name: Intake
+          color: PURPLE
+        - name: Intake review
           color: YELLOW
         - name: Done
           color: PURPLE
@@ -477,5 +666,5 @@ plugins: []
 # Example — uncomment to activate the reference 3Qs plugin:
 # plugins:
 #   - name: three-questions
-#     source: github:open-agentos/agentos//plugins/three-questions@v1.1.0
+#     source: github:open-agentos/agentos//plugins/three-questions@v1.2.0
 #     description: "Daily 3Qs intelligence plugin — phase labels, watcher schedule"

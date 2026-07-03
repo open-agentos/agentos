@@ -805,14 +805,22 @@ class TestRunUpgrade:
         end = "<!-- agentOS:managed:end -->"
         file_content = f"{begin}{user_edited}{end}"
 
-        target_file = tmp_path / "agentOS.yaml"
+        # agentOS.yaml is version-bump-only; use a managed-block file for this test.
+        agent_dir = tmp_path / "agents" / "planner"
+        agent_dir.mkdir(parents=True)
+        target_file = agent_dir / "AGENT.md"
         target_file.write_text(file_content, encoding="utf-8")
 
         new_block = "\nnew from spec\n"
         new_template = _make_managed_block("planner", new_block)
         tpl_dir = tmp_path / "tpl"
         tpl_dir.mkdir()
-        (tpl_dir / "agentOS.yaml").write_text(new_template, encoding="utf-8")
+        (tpl_dir / "agents" / "planner").mkdir(parents=True)
+        (tpl_dir / "agents" / "planner" / "AGENT.md.template").write_text(new_template, encoding="utf-8")
+
+        # Also provide a minimal agentOS.yaml with specVersion so the upgrade
+        # engine can read it and proceed to managed-block processing.
+        (tmp_path / "agentOS.yaml").write_text("specVersion: 1.0.0-alpha\n", encoding="utf-8")
 
         spec = {"specVersion": "1.0.0-alpha", "runtime": {}}
         opts = UpgradeOptions(
@@ -839,13 +847,21 @@ class TestRunUpgrade:
     def test_file_without_managed_blocks_is_skipped(self, tmp_path):
         """Files with no managed markers are not touched (legacy / uninstrumented)."""
         content = "no managed blocks here\njust plain content\n"
-        target_file = tmp_path / "agentOS.yaml"
+        # agentOS.yaml is version-bump-only; use a managed-block file for this test.
+        agent_dir = tmp_path / "agents" / "planner"
+        agent_dir.mkdir(parents=True)
+        target_file = agent_dir / "AGENT.md"
         target_file.write_text(content, encoding="utf-8")
 
         new_template = _make_managed_block("planner", "\nnew\n")
         tpl_dir = tmp_path / "tpl"
         tpl_dir.mkdir()
-        (tpl_dir / "agentOS.yaml").write_text(new_template, encoding="utf-8")
+        (tpl_dir / "agents" / "planner").mkdir(parents=True)
+        (tpl_dir / "agents" / "planner" / "AGENT.md.template").write_text(new_template, encoding="utf-8")
+
+        # Also provide a minimal agentOS.yaml with specVersion so the upgrade
+        # engine can read it and proceed to managed-block processing.
+        (tmp_path / "agentOS.yaml").write_text("specVersion: 1.0.0-alpha\n", encoding="utf-8")
 
         spec = {"specVersion": "1.0.0-alpha", "runtime": {}}
         opts = UpgradeOptions(
@@ -860,7 +876,7 @@ class TestRunUpgrade:
 
         # File untouched.
         assert target_file.read_text(encoding="utf-8") == content
-        assert "agentOS.yaml" in result.files_unchanged
+        assert "agents/planner/AGENT.md" in result.files_unchanged
 
     def test_missing_target_dir_agentosyaml_returns_error(self, tmp_path):
         """If agentOS.yaml is absent and spec not provided, result contains an error."""

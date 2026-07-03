@@ -19,7 +19,7 @@
     "specId": {
       "type": "string",
       "description": "Stable identifier for this spec. Used for dependency pinning.",
-      "pattern": "^[a-z][a-z0-9-]*$",
+      "pattern": "^[a-z][a-zA-Z0-9-]*$",
       "examples": ["github-agentOS"]
     },
 
@@ -117,6 +117,223 @@
           "type": "string",
           "description": "HTML comment marker used to identify run receipt comments.",
           "default": "<!-- agentOS:run-receipt -->"
+        }
+      }
+    },
+
+    "governance": {
+      "type": "object",
+      "description": "Planning stage, approval gate, and provenance-weighted governance (SPEC.md §3.6, §12.9).",
+      "additionalProperties": false,
+      "properties": {
+        "planning": {
+          "type": "string",
+          "enum": ["required", "optional", "off"],
+          "default": "required",
+          "description": "Whether a plan and approval are required before the builder runs."
+        },
+        "approvers": {
+          "type": "array",
+          "description": "GitHub collaborator permission levels whose approval commands authorise a build.",
+          "items": {
+            "type": "string",
+            "enum": ["admin", "maintain", "write", "triage", "read"]
+          },
+          "default": ["admin"]
+        },
+        "approve_command": {
+          "type": "string",
+          "default": "/approve-plan",
+          "description": "Slash-command that approves a plan."
+        },
+        "changes_command": {
+          "type": "string",
+          "default": "/request-changes",
+          "description": "Slash-command that sends an issue back to status:plan."
+        },
+        "plan_begin_marker": {
+          "type": "string",
+          "default": "<!-- AGENTOS:PLAN:BEGIN -->"
+        },
+        "plan_end_marker": {
+          "type": "string",
+          "default": "<!-- AGENTOS:PLAN:END -->"
+        },
+        "wild": {
+          "type": "object",
+          "description": "Stricter downstream defaults for issues carrying source:wild (SPEC.md §12.9).",
+          "additionalProperties": false,
+          "properties": {
+            "auto_merge": {
+              "type": "boolean",
+              "default": false,
+              "description": "Whether wild PRs may auto-merge. False regardless of repo default."
+            },
+            "final_approval": {
+              "type": "string",
+              "enum": ["human"],
+              "default": "human",
+              "description": "Who performs the final merge for wild work. v1.2 permits only 'human'."
+            },
+            "max_review_cycles": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 2,
+              "description": "Review cycles before escalation; tighter than the planned-lane default."
+            },
+            "changes_requested_routes_to": {
+              "type": "string",
+              "enum": ["builder", "author"],
+              "default": "builder",
+              "description": "Whether an agent iterates on wild code after review, or the review is posted for a human push."
+            }
+          }
+        }
+      }
+    },
+
+    "intake": {
+      "type": "object",
+      "description": "The unplanned ('wild') PR pipeline: classification, stub issues, janitors, the archaeologist, and /approve-intent (SPEC.md §12).",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "exclude_actors": {
+          "type": "array",
+          "description": "PR authors ignored by intake entirely (bot flood guard).",
+          "items": { "type": "string" },
+          "default": ["dependabot[bot]", "renovate[bot]"]
+        },
+        "linked_prs": {
+          "type": "string",
+          "enum": ["ignore", "janitors-report-only"],
+          "default": "ignore",
+          "description": "Treatment of human PRs that have a closing-linked issue."
+        },
+        "settle_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 300,
+          "description": "Quiet period (no author pushes) before autofix janitors and the archaeologist run."
+        },
+        "convergence_passes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 2,
+          "description": "Max full janitor-sequence passes before declaring non-convergence."
+        },
+        "test_oracle": {
+          "type": "string",
+          "enum": ["auto", "off"],
+          "default": "auto",
+          "description": "Run the repo test suite before/after autofix as a behavioural oracle."
+        },
+        "max_diff_lines": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 6000,
+          "description": "Above this diff size, skip interpretation: facts-only reconstruction."
+        },
+        "max_recon_runs": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5,
+          "description": "Max archaeologist runs per stub; beyond it, facts-only mode."
+        },
+        "model": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "Archaeologist model override; null = orchestrator default."
+        },
+        "approve_intent_self": {
+          "type": "boolean",
+          "default": true,
+          "description": "May the PR author approve their own intent (if they hold the authoriser role)?"
+        },
+        "tripwire_paths": {
+          "type": "array",
+          "description": "Deterministic path rules; any diff match routes the stub to status:blocked before any agent runs.",
+          "items": { "type": "string" }
+        },
+        "janitors": {
+          "type": "array",
+          "description": "Janitor sequence, run serially in declared order (SPEC.md §12.5).",
+          "items": {
+            "type": "object",
+            "required": ["name", "run", "mode"],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9-]*$"
+              },
+              "run": {
+                "type": "string",
+                "description": "Shell command that runs this janitor tool."
+              },
+              "mode": {
+                "type": "string",
+                "enum": ["autofix", "report", "off"],
+                "description": "autofix pushes commits; report emits check runs and findings only."
+              },
+              "block_on": {
+                "type": "string",
+                "enum": ["critical", "any"],
+                "description": "Route the stub to status:blocked when findings at or above this severity exist. Omit to never block on this janitor's findings."
+              }
+            }
+          }
+        },
+        "paths": {
+          "type": "object",
+          "description": "Per-path janitor mode ratchet. Glob keys map to a mode override for files matching that path. Example: 'legacy/**': {janitors_mode: report} keeps legacy code report-only even if the global mode is autofix.",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["janitors_mode"],
+            "additionalProperties": false,
+            "properties": {
+              "janitors_mode": {
+                "type": "string",
+                "enum": ["autofix", "report", "off"]
+              }
+            }
+          }
+        },
+        "forks": {
+          "type": "object",
+          "description": "Fork-specific overrides (SPEC.md §12.2.5).",
+          "additionalProperties": false,
+          "properties": {
+            "autofix": {
+              "type": "boolean",
+              "default": false,
+              "description": "Whether autofix janitors run on fork PRs. Always false per spec; not configurable upward."
+            }
+          }
+        },
+        "reports": {
+          "type": "object",
+          "description": "Report-to-work: how report findings become follow-on issues at settlement (SPEC.md §12.8.4).",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["file", "start"],
+            "additionalProperties": false,
+            "properties": {
+              "file": {
+                "type": "string",
+                "enum": ["auto", "off"],
+                "description": "Whether to file an issue for this category at settlement."
+              },
+              "start": {
+                "type": "string",
+                "enum": ["auto", "manual"],
+                "description": "auto applies status:todo on the spawned issue; manual leaves launch timing to a human."
+              }
+            }
+          }
         }
       }
     },

@@ -401,6 +401,80 @@ merged or issue closed). It is a separate JSONL line with `event: settlement`.
     failed            The run ended in status:blocked and the issue was manually closed.
     timed_out         The run hit the timeout limit and the issue was manually closed.
 
+Note: an issue may accumulate multiple settlement records (e.g. a wild PR
+cancelled and later reopened, then merged — SPEC.md §12.4.2). Consumers MUST
+tolerate multiple settlement records per issue; the latest is authoritative.
+
+---
+
+## 11.1 Intake Extensions (v1.2)
+
+The intake pipeline (SPEC.md §12) extends the existing schemas. No new metrics
+infrastructure and no schema_version bump: all additions are new optional
+fields in existing record shapes.
+
+### Janitor run records
+
+Janitor batches write standard run records with `identity.role: "janitor"`.
+They additionally carry:
+
+    "intake": {
+      "tools": [                       // per-tool outcomes, in declared order
+        {"name": "format",  "mode": "autofix", "commit_sha": "abc123", "findings": 0},
+        {"name": "semgrep", "mode": "report",  "commit_sha": null,     "findings": 2}
+      ],
+      "findings_by_category": {"lint": 41, "security": 2},
+      "convergence_passes": 1,         // passes needed to reach an empty diff
+      "oracle": "pass"                 // pass | fail | none (no baseline suite)
+    }
+
+### Archaeologist run records
+
+Archaeologist runs write standard run records with
+`identity.role: "archaeologist"`. They additionally carry:
+
+    "intake": {
+      "confidence": "medium",          // high | medium | low
+      "proposed_type": "feature",
+      "diff_lines": 412,
+      "facts_only": false              // true when max_diff_lines/max_recon_runs hit
+    }
+
+### Wild settlement records
+
+Settlement records for `source:wild` issues extend the settlement schema:
+
+    {
+      "schema_version": 6,
+      "event": "settlement",
+      "source": "wild",
+      "intake": {
+        "janitor_commits": 3,
+        "findings": {"lint": 41, "security": 2},
+        "dismissals": [
+          {"category": "lint", "actor": "some-admin", "at": "2026-01-15T16:00:00Z",
+           "reason": "generated code; formatting intentional"}
+        ],
+        "recon_confidence": "medium",
+        "recon_runs": 2,
+        "intent_approved_by": "some-admin",
+        "approval_to_merge_seconds": 4210,
+        "gates_bypassed": false        // true if an admin merged past unsatisfied gates
+      },
+      "outcome": "merged",
+      ...
+    }
+
+`gates_bypassed: true` records an admin force-merge that skipped
+`/approve-intent` or review — observability instead of prevention; the
+merging actor is recorded in `merged_by`.
+
+### Dashboard additions
+
+The wild lane appears in the existing dashboard: intake funnel
+(classified → reconstructed → intent-approved → merged), janitor autofix
+volume, findings filed/fixed/dismissed/aging, and wild-vs-planned cycle time.
+
 ---
 
 ## 12. Model Rates

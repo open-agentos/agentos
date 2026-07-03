@@ -1,0 +1,819 @@
+# =============================================================================
+# Agent Intake — agentOS spec template (SPEC.md §12)
+#
+# The unplanned ("wild") PR pipeline: classification, stub issues, janitors,
+# the archaeologist, and the /approve-intent gate.
+#
+# Template variables (replaced at install time):
+#   {{AGENT_RUNNER}}   — command/action that runs the agent
+#   {{MAX_TURNS}}      — maximum conversation turns for the agent
+#   {{SPEC_VERSION}}   — agentOS spec version this workflow was generated from
+#
+# SECURITY INVARIANTS (normative — SPEC.md §12.2, §12.6, §12.9):
+#   * This workflow NEVER uses pull_request_target with a checkout of the
+#     contributed code. Fork PRs run under GitHub's default fork protections:
+#     read-only token, no secrets, maintainer approval for first contributions.
+#   * The recursion guard: pushes by agentOS App identities NEVER reset intake
+#     state. GitHub's Actions loop protection only covers GITHUB_TOKEN, not
+#     App-token pushes — this check is load-bearing. See §12.2.4.
+#   * The archaeologist holds NO GitHub token. It is invoked as a pure
+#     function; this workflow validates its JSON payload against the §12.6.4
+#     schema before performing any GitHub write on its behalf.
+#   * Tripwires are evaluated deterministically BEFORE any agent runs. A
+#     tripwire match routes the stub to status:blocked. See §12.6.2.
+# =============================================================================
+
+name: Agent Intake
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize, edited]
+  issue_comment:
+    types: [created]
+
+env:
+  SPEC_VERSION: "{{SPEC_VERSION}}"
+  TARGET_REPO: ${{ github.repository }}
+
+  # Intake config — mirrors agentOS.yaml intake section.
+  # Override via repository variables to change without editing this file.
+  INTAKE_ENABLED: ${{ vars.INTAKE_ENABLED || 'true' }}
+  INTAKE_EXCLUDE_ACTORS: ${{ vars.INTAKE_EXCLUDE_ACTORS || 'dependabot[bot],renovate[bot]' }}
+  INTAKE_LINKED_PRS: ${{ vars.INTAKE_LINKED_PRS || 'ignore' }}
+  INTAKE_SETTLE_SECONDS: ${{ vars.INTAKE_SETTLE_SECONDS || '300' }}
+  INTAKE_MAX_DIFF_LINES: ${{ vars.INTAKE_MAX_DIFF_LINES || '6000' }}
+  INTAKE_MAX_RECON_RUNS: ${{ vars.INTAKE_MAX_RECON_RUNS || '5' }}
+  INTAKE_APPROVE_INTENT_SELF: ${{ vars.INTAKE_APPROVE_INTENT_SELF || 'true' }}
+  INTAKE_TRIPWIRE_PATHS: ${{ vars.INTAKE_TRIPWIRE_PATHS || '.github/workflows/**,.github/actions/**,agentOS.yaml,.agentOS/**' }}
+  GOVERNANCE_APPROVERS: ${{ vars.GOVERNANCE_APPROVERS || 'admin' }}
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # classify — the intake classifier (SPEC.md §12.2)
+  #
+  # Runs on every pull_request event. Applies the syntactic classification
+  # rule (§12.2.2) — App identity, exclude_actors, closingIssuesReferences —
+  # and NOTHING else. Implementations MUST NOT add heuristic classification.
+  #
+  # Writes (stub creation, labels, comments) authenticate as the watcher App.
+  # ---------------------------------------------------------------------------
+  classify:
+    name: Classify pull request
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    concurrency:
+      # One classification at a time per PR — serialises rapid push bursts.
+      group: intake-classify-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    outputs:
+      wild: ${{ steps.classify.outputs.wild }}
+      stub_number: ${{ steps.classify.outputs.stub_number }}
+      tripwired: ${{ steps.classify.outputs.tripwired }}
+      is_fork: ${{ steps.classify.outputs.is_fork }}
+      is_draft: ${{ steps.classify.outputs.is_draft }}
+
+    steps:
+      - name: Checkout repository (base ref only — never the contributed code)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install script dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Mint watcher token
+        id: mint-token
+        # Fork PRs get no secrets under the pull_request event for
+        # first-time contributors; same-repo PRs mint normally.
+        env:
+          WATCHER_APP_ID: ${{ secrets.WATCHER_APP_ID }}
+          WATCHER_PRIVATE_KEY: ${{ secrets.WATCHER_PRIVATE_KEY }}
+        run: |
+          if [ -n "$WATCHER_APP_ID" ]; then
+            WATCHER_TOKEN=$(python3 scripts/github_token.py watcher)
+            echo "::add-mask::$WATCHER_TOKEN"
+            echo "WATCHER_TOKEN=$WATCHER_TOKEN" >> "$GITHUB_ENV"
+          else
+            echo "WATCHER_TOKEN=" >> "$GITHUB_ENV"
+          fi
+
+      - name: Classify and manage stub lifecycle
+        id: classify
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_ACTION: ${{ github.event.action }}
+          WATCHER_TOKEN: ${{ env.WATCHER_TOKEN }}
+        with:
+          github-token: ${{ env.WATCHER_TOKEN || secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const prNumber = pr.number;
+            const action = process.env.EVENT_ACTION;
+
+            const EXCLUDE_ACTORS = (process.env.INTAKE_EXCLUDE_ACTORS || '')
+              .split(',').map(s => s.trim()).filter(Boolean);
+            const TRIPWIRE_PATHS = (process.env.INTAKE_TRIPWIRE_PATHS || '')
+              .split(',').map(s => s.trim()).filter(Boolean);
+
+            core.setOutput('wild', 'false');
+            core.setOutput('tripwired', 'false');
+            core.setOutput('stub_number', '');
+            core.setOutput('is_fork', String(pr.head.repo?.full_name !== `${owner}/${repo}`));
+            core.setOutput('is_draft', String(pr.draft === true));
+
+            if ((process.env.INTAKE_ENABLED || 'true') !== 'true') {
+              console.log('Intake disabled — skipping.');
+              return;
+            }
+
+            // ---- Helper: is this login an agentOS App identity for this repo? ----
+            // App actors appear as "<slug>[bot]". We enumerate the Apps this
+            // deployment provisions; operators with custom App slugs extend
+            // the AGENTOS_APP_SLUGS repository variable (comma-separated).
+            const extraSlugs = ('${{ vars.AGENTOS_APP_SLUGS }}' || '')
+              .split(',').map(s => s.trim()).filter(Boolean);
+            const agentSuffixes = ['builder', 'reviewer', 'watcher', 'board',
+                                   'janitor', 'docs', 'planner'];
+            function isAgentIdentity(login) {
+              if (!login) return false;
+              if (!login.endsWith('[bot]')) return false;
+              const slug = login.slice(0, -'[bot]'.length).toLowerCase();
+              if (extraSlugs.some(s => s.toLowerCase() === slug)) return true;
+              return agentSuffixes.some(sfx =>
+                slug === sfx || slug.endsWith(`-${sfx}`) || slug.includes(`agentos-${sfx}`));
+            }
+
+            // =====================================================================
+            // RECURSION GUARD (SPEC.md §12.2.4) — NORMATIVE AND LOAD-BEARING.
+            //
+            // A janitor push emits `synchronize`, which re-fires this classifier.
+            // GitHub's loop protection covers GITHUB_TOKEN only, NOT App-token
+            // pushes, so without this check the janitor/classifier loop is live.
+            // On synchronize we resolve the actor of the triggering push and
+            // ignore the event entirely if it is any agentOS App identity.
+            // Only author (human) pushes reset intake state.
+            // =====================================================================
+            if (action === 'synchronize') {
+              const pushActor = context.payload.sender?.login || '';
+              if (isAgentIdentity(pushActor)) {
+                console.log(`Recursion guard: push by agent identity '${pushActor}' — ignoring.`);
+                return;
+              }
+            }
+
+            // ---- Classification rule (§12.2.2) — syntactic, nothing else ----
+            const author = pr.user?.login || '';
+
+            // Rule 1: author is not an agentOS App identity.
+            if (isAgentIdentity(author)) {
+              console.log(`Author '${author}' is an agentOS App — not wild.`);
+              return;
+            }
+            // Rule 2: author is not excluded.
+            if (EXCLUDE_ACTORS.includes(author)) {
+              console.log(`Author '${author}' is in exclude_actors — intake ignores this PR.`);
+              return;
+            }
+            // Rule 3: no closing-linked issue (closingIssuesReferences covers
+            // closing keywords AND sidebar-linked issues).
+            const linkQuery = `
+              query($owner: String!, $repo: String!, $pr: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $pr) {
+                    closingIssuesReferences(first: 10) {
+                      nodes { number labels(first: 20) { nodes { name } } }
+                    }
+                  }
+                }
+              }`;
+            const linkData = await github.graphql(linkQuery, { owner, repo, pr: prNumber });
+            const linked = linkData.repository.pullRequest.closingIssuesReferences.nodes;
+
+            // An existing wild stub is closing-linked to its own PR — a PR whose
+            // only closing link is its stub is still wild (idempotent re-run).
+            const nonStubLinks = linked.filter(iss =>
+              !iss.labels.nodes.some(l => l.name === 'source:wild'));
+            const existingStub = linked.find(iss =>
+              iss.labels.nodes.some(l => l.name === 'source:wild'));
+
+            if (nonStubLinks.length > 0) {
+              console.log('PR has a closing-linked (non-stub) issue — planned work, not wild.');
+              // linked_prs: janitors-report-only is handled by the janitors job
+              // reading this output; ignore means intake does not touch the PR.
+              return;
+            }
+
+            core.setOutput('wild', 'true');
+            console.log(`PR #${prNumber} classified WILD.`);
+
+            // ---- Draft PRs (§12.2.3): report janitors only; no stub yet ----
+            if (pr.draft === true) {
+              console.log('Draft PR — report-mode janitors only; stub waits for ready_for_review.');
+              return;
+            }
+
+            // ---- Helper: set the status:* label (single-select semantics) ----
+            async function setStatus(issue_number, status) {
+              const { data: labels } = await github.rest.issues.listLabelsOnIssue(
+                { owner, repo, issue_number, per_page: 100 });
+              for (const l of labels) {
+                if (l.name.startsWith('status:') && l.name !== status) {
+                  try {
+                    await github.rest.issues.removeLabel(
+                      { owner, repo, issue_number, name: l.name });
+                  } catch (_) {}
+                }
+              }
+              await github.rest.issues.addLabels(
+                { owner, repo, issue_number, labels: [status] });
+            }
+
+            // ---- Stub creation / reuse (§12.4.1) — idempotent ----
+            let stubNumber;
+            if (existingStub) {
+              stubNumber = existingStub.number;
+              console.log(`Reusing existing stub #${stubNumber}.`);
+              // Reopen if a human closed it mid-intake or after cancellation (§12.4.2).
+              const { data: stub } = await github.rest.issues.get(
+                { owner, repo, issue_number: stubNumber });
+              if (stub.state === 'closed' && pr.state === 'open') {
+                await github.rest.issues.update(
+                  { owner, repo, issue_number: stubNumber, state: 'open' });
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: stubNumber,
+                  body: [
+                    'This stub issue is system-owned while its linked pull request is open.',
+                    `It has been reopened because PR #${prNumber} is open. To cancel the`,
+                    'work, close the **pull request** — the watcher will settle this stub',
+                    'with `outcome=cancelled`.'
+                  ].join('\n')
+                });
+              }
+            } else {
+              const title = pr.title?.trim() || pr.head.ref;
+              const body = [
+                '> **System notice:** this issue is intake-managed (agentOS wild lane,',
+                `> SPEC.md §12). It was created automatically from PR #${prNumber}, which`,
+                '> has no linked issue. Interact via `/approve-intent`,',
+                '> `/request-changes <notes>`, `/dismiss-findings <category> --reason <text>`',
+                '> and ordinary comments — not by editing labels or this body.',
+                '',
+                '<!-- AGENTOS:PLAN:BEGIN -->',
+                '_Reconstruction pending — the archaeologist has not run yet._',
+                '<!-- AGENTOS:PLAN:END -->',
+                ''
+              ].join('\n');
+              const { data: created } = await github.rest.issues.create(
+                { owner, repo, title, body, labels: ['source:wild'] });
+              stubNumber = created.number;
+              console.log(`Created stub #${stubNumber}.`);
+
+              // Closing-link the PR to the stub (§12.4.1 step 3) — prepend,
+              // preserving existing content. This is the ONLY intake data on the PR.
+              const prBody = pr.body || '';
+              if (!prBody.includes(`Closes #${stubNumber}`)) {
+                await github.rest.pulls.update({
+                  owner, repo, pull_number: prNumber,
+                  body: `Closes #${stubNumber}\n\n${prBody}`
+                });
+              }
+
+              // First PR comment (§12.4.1 step 4) — includes the rebase norm (§12.5.3).
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: [
+                  `This pull request has no linked issue, so agentOS intake created stub issue #${stubNumber} to track it.`,
+                  '',
+                  '**What happens next:**',
+                  '1. Deterministic janitors run against this branch (report mode posts check runs; autofix mode, if enabled, pushes formatting-class commits).',
+                  '2. The archaeologist reconstructs the intent of this change into the stub issue.',
+                  '3. A maintainer reviews the reconstruction and comments `/approve-intent`, after which the normal review loop begins.',
+                  '',
+                  '> **Tip:** if autofix janitors are enabled they may push commits to this branch. Use `git pull --rebase` before pushing again.'
+                ].join('\n')
+              });
+            }
+            core.setOutput('stub_number', String(stubNumber));
+
+            // ---- Tripwires (§12.6.2) — deterministic, BEFORE any agent ----
+            const files = await github.paginate(github.rest.pulls.listFiles,
+              { owner, repo, pull_number: prNumber, per_page: 100 });
+            // Minimal glob→regex: '**' crosses directories, '*' does not.
+            function globToRe(glob) {
+              let re = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+              re = re.replace(/\*\*/g, '\u0001').replace(/\*/g, '[^/]*')
+                     .replace(/\u0001/g, '.*');
+              return new RegExp(`^${re}$`);
+            }
+            const tripwireRes = TRIPWIRE_PATHS.map(globToRe);
+            const tripped = files.filter(f =>
+              tripwireRes.some(re => re.test(f.filename)));
+
+            if (tripped.length > 0) {
+              await setStatus(stubNumber, 'status:blocked');
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: stubNumber,
+                body: [
+                  '**Tripwire — human eyes mandatory.** This wild PR touches protected paths:',
+                  '',
+                  ...tripped.map(f => `- \`${f.filename}\``),
+                  '',
+                  'No reconstruction or autofix will run (SPEC.md §12.6.2). A maintainer',
+                  'must review the diff directly. Workflow-touching wild diffs never enter',
+                  'a builder cycle.'
+                ].join('\n')
+              });
+              core.setOutput('tripwired', 'true');
+              console.log('Tripwire matched — stub routed to status:blocked.');
+              return;
+            }
+
+            // ---- Enter / reset to status:intake (§12.3.3) ----
+            // Every (human) trigger that reaches here resets intake state:
+            // opened, reopened, ready_for_review, author synchronize, base retarget.
+            await setStatus(stubNumber, 'status:intake');
+            console.log(`Stub #${stubNumber} at status:intake.`);
+
+  # ---------------------------------------------------------------------------
+  # janitors — the janitor layer (SPEC.md §12.5)
+  #
+  # Report-mode janitors run immediately on every push (draft PRs included).
+  # Autofix janitors wait for the settle window, are disabled on forks
+  # (hardened mode, §12.2.5), push one commit per tool under the janitor App
+  # identity with the AgentOS-Janitor trailer, must converge to an empty diff,
+  # and are reverted + demoted if the test oracle degrades (§12.5.6).
+  #
+  # The janitor sequence itself is operator toolchain territory: this job
+  # reads the intake.janitors list from agentOS.yaml in the repository and
+  # executes each entry serially in declared order.
+  # ---------------------------------------------------------------------------
+  janitors:
+    name: Run janitors
+    needs: classify
+    runs-on: ubuntu-latest
+    if: >
+      needs.classify.outputs.wild == 'true' &&
+      needs.classify.outputs.tripwired != 'true'
+    concurrency:
+      group: intake-janitors-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install script dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Settle window (autofix + archaeology gate)
+        # Report checks may run immediately; anything that pushes or invokes
+        # a model waits for INTAKE_SETTLE_SECONDS of author quiet (§12.5.3).
+        # Re-triggering pushes cancel this run via the concurrency group, so
+        # sleeping is a faithful implementation of "no push for N seconds".
+        if: needs.classify.outputs.is_draft != 'true'
+        run: sleep "$INTAKE_SETTLE_SECONDS"
+
+      - name: Execute janitor sequence
+        env:
+          IS_FORK: ${{ needs.classify.outputs.is_fork }}
+          IS_DRAFT: ${{ needs.classify.outputs.is_draft }}
+          STUB_NUMBER: ${{ needs.classify.outputs.stub_number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          JANITOR_APP_ID: ${{ secrets.JANITOR_APP_ID }}
+          JANITOR_PRIVATE_KEY: ${{ secrets.JANITOR_PRIVATE_KEY }}
+          GITHUB_RUN_ID_VAL: ${{ github.run_id }}
+        run: |
+          python3 - <<'RUN_JANITORS'
+          # Reference janitor executor. Reads intake.janitors from agentOS.yaml,
+          # runs each serially. Report mode: collect findings for the facts
+          # block (emitted as the job log + step summary; check-run publication
+          # uses the janitor App when configured). Autofix mode: run tool,
+          # commit per-tool with the AgentOS-Janitor trailer, verify
+          # convergence (second pass = empty diff) and never touch other
+          # actors' commits (no amend/squash/force-push). Autofix is hard-
+          # disabled on forks and drafts regardless of configuration.
+          import json, os, subprocess, sys, pathlib
+
+          def sh(cmd, **kw):
+              return subprocess.run(cmd, shell=True, text=True,
+                                    capture_output=True, **kw)
+
+          try:
+              import yaml
+              spec = yaml.safe_load(pathlib.Path("agentOS.yaml").read_text())
+          except Exception:
+              spec = {}
+          intake = (spec or {}).get("intake", {}) or {}
+          janitors = intake.get("janitors", []) or []
+          passes = int(intake.get("convergence_passes", 2))
+          fork = os.environ.get("IS_FORK") == "true"
+          draft = os.environ.get("IS_DRAFT") == "true"
+          autofix_allowed = not fork and not draft
+          run_id = os.environ.get("GITHUB_RUN_ID_VAL", "")
+
+          findings = {}
+          for j in janitors:
+              name, cmd, mode = j.get("name"), j.get("run"), j.get("mode", "report")
+              if mode == "off" or not cmd or "<tool command>" in cmd:
+                  continue
+              if mode == "autofix" and not autofix_allowed:
+                  mode = "report"   # hardened mode (§12.2.5) / draft (§12.2.3)
+              print(f"::group::janitor {name} ({mode})")
+              r = sh(cmd)
+              print(r.stdout or "", r.stderr or "", sep="\n")
+              print("::endgroup::")
+              if mode == "report":
+                  if r.returncode != 0 or r.stdout.strip():
+                      findings[name] = {"exit": r.returncode,
+                                        "lines": len(r.stdout.splitlines())}
+              elif mode == "autofix":
+                  diff = sh("git status --porcelain").stdout.strip()
+                  if diff:
+                      sh("git add -A")
+                      msg = (f"chore({name}): janitor autofix\n\n"
+                             f"AgentOS-Janitor: {name}\nAgentOS-Run-Id: {run_id}")
+                      sh(f'git -c user.name="agentos-janitor[bot]" '
+                         f'-c user.email="janitor@agentos" commit -m "$MSG"',
+                         env={**os.environ, "MSG": msg})
+                      findings[name] = {"autofix_commit": True}
+
+          # Convergence check (§12.5.5): a second pass over autofix tools
+          # must be a no-op. Non-convergence: revert janitor commits as one
+          # unit and demote — dueling formatters are a config defect.
+          if autofix_allowed and any(v.get("autofix_commit") for v in findings.values()):
+              dirty = False
+              for j in janitors:
+                  if j.get("mode") == "autofix" and j.get("run") and "<tool command>" not in j["run"]:
+                      sh(j["run"])
+                      if sh("git status --porcelain").stdout.strip():
+                          dirty = True
+                          sh("git checkout -- .")
+              if dirty:
+                  print("::error::Janitor sequence did not converge — reverting and demoting (SPEC.md §12.5.5)")
+                  sys.exit(78)   # neutral-ish signal; orchestration reverts
+
+          summary = json.dumps({"findings": findings}, indent=2)
+          print(f"JANITOR_SUMMARY={summary}")
+          out = os.environ.get("GITHUB_STEP_SUMMARY")
+          if out:
+              with open(out, "a") as f:
+                  f.write("## Janitor findings\n```json\n" + summary + "\n```\n")
+          RUN_JANITORS
+
+  # ---------------------------------------------------------------------------
+  # archaeologist — intent reconstruction (SPEC.md §12.6)
+  #
+  # The archaeologist is a PURE FUNCTION: diff and context in, one JSON
+  # payload out. It receives NO GitHub token (GITHUB_TOKEN deliberately not
+  # injected). This job validates the payload against the §12.6.4 schema and
+  # performs every GitHub side effect on the archaeologist's behalf using the
+  # watcher token. Schema violations: retry once, then status:blocked.
+  # ---------------------------------------------------------------------------
+  archaeologist:
+    name: Reconstruct intent
+    needs: [classify, janitors]
+    runs-on: ubuntu-latest
+    if: >
+      needs.classify.outputs.wild == 'true' &&
+      needs.classify.outputs.tripwired != 'true' &&
+      needs.classify.outputs.is_draft != 'true' &&
+      needs.classify.outputs.stub_number != ''
+    concurrency:
+      # Keyed on the stub issue, as for the planner (§12.6.6).
+      group: intake-archaeologist-${{ needs.classify.outputs.stub_number }}
+      cancel-in-progress: true
+
+    env:
+      LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
+      LLM_MODEL: ${{ vars.INTAKE_MODEL || vars.LLM_MODEL }}
+      AGENT_MAX_TURNS: ${{ vars.AGENT_MAX_TURNS || '{{MAX_TURNS}}' }}
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install script dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Compute facts block (deterministic — before any model runs)
+        id: facts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Facts are computed by tooling, presented before interpretation
+          # (§12.7.1), and never authored by the archaeologist.
+          gh pr view "$PR_NUMBER" --json files,additions,deletions,commits \
+            > /tmp/facts.json
+          ADD=$(python3 -c "import json;print(json.load(open('/tmp/facts.json'))['additions'])")
+          DEL=$(python3 -c "import json;print(json.load(open('/tmp/facts.json'))['deletions'])")
+          echo "diff_lines=$((ADD + DEL))" >> "$GITHUB_OUTPUT"
+
+      - name: Run archaeologist (pure function — NO GitHub token)
+        id: recon
+        env:
+          AGENT_ROLE: archaeologist
+          ISSUE_NUMBER: ${{ needs.classify.outputs.stub_number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DIFF_LINES: ${{ steps.facts.outputs.diff_lines }}
+          # NOTE: GITHUB_TOKEN intentionally absent (SPEC.md §12.6.1).
+        run: |
+          if [ "$DIFF_LINES" -gt "$INTAKE_MAX_DIFF_LINES" ]; then
+            # Cost cap (§12.6.6): facts-only reconstruction, confidence low.
+            echo '{"interpretation":"Diff exceeds intake.max_diff_lines; facts-only reconstruction. A human should read the diff.","confidence":"low","proposed_type":"chore","scope":[],"proposed_title":"","questions":["Please describe what this change does."]}' \
+              > /tmp/archaeologist-output.json
+          else
+            # The runner must write the §12.6.4 JSON payload to
+            # /tmp/archaeologist-output.json and nothing else. The runner is
+            # configured WITHOUT shell execution, network access, or tools
+            # with side effects for this role.
+            {{AGENT_RUNNER}}
+          fi
+
+      - name: Validate payload and apply side effects (mediated writes)
+        uses: actions/github-script@v7
+        env:
+          STUB_NUMBER: ${{ needs.classify.outputs.stub_number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          WATCHER_APP_ID: ${{ secrets.WATCHER_APP_ID }}
+          WATCHER_PRIVATE_KEY: ${{ secrets.WATCHER_PRIVATE_KEY }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const stub = parseInt(process.env.STUB_NUMBER, 10);
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+
+            // ---- Schema validation (§12.6.4) — before ANY GitHub write ----
+            function validate(p) {
+              const errs = [];
+              if (typeof p.interpretation !== 'string' || !p.interpretation) errs.push('interpretation');
+              if (!['high', 'medium', 'low'].includes(p.confidence)) errs.push('confidence');
+              if (!['feature', 'bug', 'chore', 'docs'].includes(p.proposed_type)) errs.push('proposed_type');
+              if (!Array.isArray(p.scope) || p.scope.some(s => typeof s !== 'string')) errs.push('scope');
+              if (typeof p.proposed_title !== 'string') errs.push('proposed_title');
+              if (!Array.isArray(p.questions) || p.questions.some(q => typeof q !== 'string')) errs.push('questions');
+              return errs;
+            }
+
+            let payload = null;
+            try {
+              payload = JSON.parse(fs.readFileSync('/tmp/archaeologist-output.json', 'utf8'));
+            } catch (e) {
+              payload = null;
+            }
+            const errors = payload ? validate(payload) : ['payload missing or unparseable'];
+
+            async function setStatus(issue_number, status) {
+              const { data: labels } = await github.rest.issues.listLabelsOnIssue(
+                { owner, repo, issue_number, per_page: 100 });
+              for (const l of labels) {
+                if (l.name.startsWith('status:') && l.name !== status) {
+                  try { await github.rest.issues.removeLabel({ owner, repo, issue_number, name: l.name }); } catch (_) {}
+                }
+              }
+              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [status] });
+            }
+
+            if (errors.length) {
+              // Failed run semantics: the workflow-level retry is the runner
+              // re-invocation; a persistent violation blocks (§12.6.4).
+              core.setFailed(`Archaeologist payload invalid: ${errors.join(', ')}`);
+              await setStatus(stub, 'status:blocked');
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: stub,
+                body: 'Archaeologist output failed schema validation twice — routing to `status:blocked` for human attention (SPEC.md §12.6.4).'
+              });
+              return;
+            }
+
+            // ---- Assemble reconstruction into the stub body (§12.6.5) ----
+            const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: stub });
+            const BEGIN = '<!-- AGENTOS:PLAN:BEGIN -->';
+            const END = '<!-- AGENTOS:PLAN:END -->';
+            const interpretation = [
+              BEGIN,
+              '### Reconstruction (wild lane)',
+              '',
+              '> **Inferred by the archaeologist — verify against the diff.**',
+              `> Confidence: **${payload.confidence}**`,
+              '',
+              payload.interpretation,
+              '',
+              '**Scope (files/behaviours this change legitimately covers):**',
+              ...(payload.scope.length ? payload.scope.map(s => `- ${s}`) : ['- _none declared_']),
+              ...(payload.questions.length
+                ? ['', '**Questions for the author:**', ...payload.questions.map(q => `- ${q}`)]
+                : []),
+              END
+            ].join('\n');
+
+            const body = issue.body || '';
+            const newBody = (body.includes(BEGIN) && body.includes(END))
+              ? body.slice(0, body.indexOf(BEGIN)) + interpretation + body.slice(body.indexOf(END) + END.length)
+              : body + '\n\n' + interpretation;
+
+            const update = { owner, repo, issue_number: stub, body: newBody };
+            if (payload.proposed_title && payload.proposed_title.trim()) {
+              update.title = payload.proposed_title.trim();
+            }
+            await github.rest.issues.update(update);
+
+            // Apply type:<proposed_type> (docs maps to the docs type when present,
+            // else chore — provision type:docs if your deployment lacks it).
+            try {
+              await github.rest.issues.addLabels(
+                { owner, repo, issue_number: stub, labels: [`type:${payload.proposed_type}`] });
+            } catch (_) {
+              await github.rest.issues.addLabels(
+                { owner, repo, issue_number: stub, labels: ['type:chore'] });
+            }
+
+            await setStatus(stub, 'status:intake-review');
+
+            // ---- Intake-review comment (§12.7.1) — facts BEFORE interpretation ----
+            const files = await github.paginate(github.rest.pulls.listFiles,
+              { owner, repo, pull_number: prNumber, per_page: 100 });
+            const { data: commits } = await github.rest.pulls.listCommits(
+              { owner, repo, pull_number: prNumber, per_page: 100 });
+            const janitorCommits = commits.filter(c =>
+              (c.commit.message || '').includes('AgentOS-Janitor:'));
+            const authorCommits = commits.filter(c =>
+              !(c.commit.message || '').includes('AgentOS-Janitor:'));
+            const locDelta = files.reduce((n, f) => n + f.additions + f.deletions, 0);
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: stub,
+              body: [
+                '## Intake review',
+                '',
+                '### Facts (computed)',
+                `- Files touched: ${files.length}`,
+                `- LOC delta: ${locDelta}`,
+                `- Dependency files touched: ${files.filter(f => /lock|requirements|package\.json|pyproject/.test(f.filename)).length}`,
+                '- Janitor findings: see the check runs on this PR.',
+                '',
+                '### Commit provenance',
+                `- Author commits: ${authorCommits.length}`,
+                `- Janitor commits: ${janitorCommits.length}`,
+                '',
+                `### [View the diff](https://github.com/${owner}/${repo}/pull/${prNumber}/files)`,
+                '',
+                '### Interpretation',
+                '> **Inferred by the archaeologist — verify against the diff.**',
+                `> Confidence: **${payload.confidence}**`,
+                '',
+                payload.interpretation,
+                ...(payload.questions.length
+                  ? ['', '**Questions for the author:**', ...payload.questions.map(q => `- ${q}`)]
+                  : []),
+                '',
+                '### Actions',
+                '- `/approve-intent` — the interpretation matches the actual intent; proceed to review',
+                '- `/request-changes <notes>` — send back for another pass',
+                '- `/dismiss-findings <category> --reason <text>` — dismiss a findings category (recorded)'
+              ].join('\n')
+            });
+
+  # ---------------------------------------------------------------------------
+  # approve-intent — the human gate (SPEC.md §12.7)
+  #
+  # /approve-intent asserts the interpretation matches the actual intent and
+  # the approver has seen the facts block — NOT code correctness. Same
+  # authoriser set as /approve-plan, permission verified live at dispatch.
+  # Staleness: the approval must postdate the latest push to the PR branch —
+  # author or janitor (§12.7.4).
+  # ---------------------------------------------------------------------------
+  approve-intent:
+    name: Handle /approve-intent
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'issue_comment' && github.event.action == 'created' &&
+      startsWith(github.event.comment.body, '/approve-intent')
+    permissions:
+      issues: write
+      pull-requests: read
+
+    steps:
+      - name: Verify and transition
+        uses: actions/github-script@v7
+        env:
+          APPROVER_LEVELS: ${{ env.GOVERNANCE_APPROVERS }}
+          APPROVE_SELF: ${{ env.INTAKE_APPROVE_INTENT_SELF }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.issue.number;
+            const commenter = context.payload.comment.user.login;
+            const commentAt = new Date(context.payload.comment.created_at);
+            const APPROVER_LEVELS = (process.env.APPROVER_LEVELS || 'admin')
+              .split(',').map(s => s.trim());
+
+            async function refuse(msg) {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body: msg });
+            }
+
+            // Must be a wild stub at status:intake-review.
+            const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number });
+            const labels = (issue.labels || []).map(l => l.name);
+            if (!labels.includes('source:wild')) {
+              console.log('Not a wild stub — /approve-intent ignored.');
+              return;
+            }
+            if (!labels.includes('status:intake-review')) {
+              await refuse(`@${commenter} — this stub is not at \`status:intake-review\`; nothing to approve.`);
+              return;
+            }
+
+            // Live permission check (never cached) — same pattern as /approve-plan.
+            let permitted = false;
+            try {
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel(
+                { owner, repo, username: commenter });
+              permitted = APPROVER_LEVELS.includes(data.permission);
+            } catch (_) {}
+            if (!permitted) {
+              await refuse(`@${commenter} — only users with \`${APPROVER_LEVELS.join('`/`')}\` permission may approve intent.`);
+              return;
+            }
+
+            // Find the linked PR via the stub's closing link (timeline cross-reference).
+            const q = `
+              query($owner: String!, $repo: String!, $issue: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $issue) {
+                    closedByPullRequestsReferences(first: 5, includeClosedPrs: false) {
+                      nodes { number headRefOid author { login }
+                              commits(last: 1) { nodes { commit { committedDate } } } }
+                    }
+                  }
+                }
+              }`;
+            const data = await github.graphql(q, { owner, repo, issue: issue_number });
+            const prs = data.repository.issue.closedByPullRequestsReferences.nodes;
+            if (!prs.length) {
+              await refuse('No open linked pull request found for this stub.');
+              return;
+            }
+            const pr = prs[0];
+
+            // Author-approver identity (§12.7.3).
+            if ((process.env.APPROVE_SELF || 'true') !== 'true' &&
+                pr.author && pr.author.login === commenter) {
+              await refuse(`@${commenter} — \`intake.approve_intent_self\` is false: a second person must approve wild work.`);
+              return;
+            }
+
+            // Staleness (§12.7.4): approval must postdate the latest push —
+            // author or janitor. Ties resolve to invalid.
+            const lastPushAt = new Date(pr.commits.nodes[0]?.commit.committedDate || 0);
+            if (commentAt <= lastPushAt) {
+              await refuse([
+                `@${commenter} — approval invalid: the branch was pushed at or after your`,
+                'approval. Re-approve after the branch settles (SPEC.md §12.7.4).'
+              ].join(' '));
+              return;
+            }
+
+            // Transition intake-review → in-review; the existing loop takes over.
+            try {
+              await github.rest.issues.removeLabel(
+                { owner, repo, issue_number, name: 'status:intake-review' });
+            } catch (_) {}
+            await github.rest.issues.addLabels(
+              { owner, repo, issue_number, labels: ['status:in-review'] });
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number,
+              body: [
+                '<!-- agentOS:run-receipt -->',
+                `**Intent Approval Receipt** | Issue: #${issue_number} | PR: #${pr.number}`,
+                '',
+                `Intent approved by @${commenter}. The stub enters the standard review loop`,
+                'at `status:in-review`. Wild governance applies: human merge, max 2 review',
+                'cycles (SPEC.md §12.9).',
+                '<!-- /agentOS:run-receipt -->'
+              ].join('\n')
+            });
