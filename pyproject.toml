@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "open-agentos-cli"
-version = "1.2.0"
+version = "1.2.1"
 description = "CLI for GitHub AgentOS — provision label-driven multi-agent orchestration"
 readme = "README.md"
 license = { text = "MIT" }
