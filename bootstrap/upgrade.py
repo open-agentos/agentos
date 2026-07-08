@@ -773,7 +773,43 @@ def run_upgrade(opts: UpgradeOptions) -> UpgradeResult:
         _write_upgrade_receipt(result, target_dir)
         _write_upgrade_conflicts(all_conflicts, target_dir)
 
+    # ---- 7. Version-specific post-upgrade notices ----
+    _emit_version_notices(result.from_version, result.to_version)
+
     return result
+
+
+def _emit_version_notices(from_version: str, to_version: str) -> None:
+    """Print manual-action notices for specific upgrade paths.
+
+    The upgrade engine patches managed blocks automatically, but some
+    changes — like GitHub App permission grants — require a human action
+    on the GitHub UI that no CLI can perform. These notices call that out
+    explicitly so operators don't miss them.
+    """
+    # Normalise: strip leading 'v', take first two dot-segments ("1.2.1" → "1.2")
+    def _norm(v: str) -> str:
+        v = v.lstrip("v")
+        parts = v.split(".")
+        return ".".join(parts[:2]) if len(parts) >= 2 else v
+
+    from_norm = _norm(from_version)
+    to_norm = _norm(to_version)
+
+    # 1.2.1 → 1.2.2: watcher App needs pull_requests:write
+    if from_norm in ("1.2", "1.2.1") and to_norm in ("1.2", "1.2.2"):
+        settings_url = "https://github.com/settings/apps"
+        print(
+            "\n⚠  Manual action required for v1.2.2:\n"
+            "   The watcher App now needs 'Pull requests: Read and write' permission.\n"
+            "   Without it, the intake closing-link write (Closes #N on wild PR bodies)\n"
+            "   fails silently and stub dedupe + merge-settlement never fire.\n\n"
+            "   1. Go to " + settings_url + " → your watcher App → Permissions & events\n"
+            "   2. Set 'Pull requests' to 'Read and write'\n"
+            "   3. Accept the permission update on your installation repo\n"
+            "      (GitHub will prompt the repo owner to approve)\n\n"
+            "   See CHANGELOG.md [1.2.2] for details."
+        )
 
 
 # ---------------------------------------------------------------------------

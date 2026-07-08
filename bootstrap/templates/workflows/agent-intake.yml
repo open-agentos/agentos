@@ -91,8 +91,6 @@ jobs:
 
       - name: Mint watcher token
         id: mint-token
-        # Fork PRs get no secrets under the pull_request event for
-        # first-time contributors; same-repo PRs mint normally.
         env:
           WATCHER_APP_ID: ${{ secrets.WATCHER_APP_ID }}
           WATCHER_PRIVATE_KEY: ${{ secrets.WATCHER_PRIVATE_KEY }}
@@ -265,7 +263,7 @@ jobs:
                 '> **System notice:** this issue is intake-managed (agentOS wild lane,',
                 `> SPEC.md §12). It was created automatically from PR #${prNumber}, which`,
                 '> has no linked issue. Interact via `/approve-intent`,',
-                '> `/request-changes <notes>`, `/dismiss-findings <category> --reason <text>`',
+                '> `/request-changes <notes>`',
                 '> and ordinary comments — not by editing labels or this body.',
                 '',
                 '<!-- AGENTOS:PLAN:BEGIN -->',
@@ -517,6 +515,10 @@ jobs:
       # Keyed on the stub issue, as for the planner (§12.6.6).
       group: intake-archaeologist-${{ needs.classify.outputs.stub_number }}
       cancel-in-progress: true
+    permissions:
+      issues: write
+      pull-requests: read
+      contents: read
 
     env:
       LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
@@ -536,6 +538,20 @@ jobs:
       - name: Install script dependencies
         run: pip install -r scripts/requirements.txt
 
+      - name: Mint watcher token
+        id: mint-token
+        env:
+          WATCHER_APP_ID: ${{ secrets.WATCHER_APP_ID }}
+          WATCHER_PRIVATE_KEY: ${{ secrets.WATCHER_PRIVATE_KEY }}
+        run: |
+          if [ -n "$WATCHER_APP_ID" ]; then
+            WATCHER_TOKEN=$(python3 scripts/github_token.py watcher)
+            echo "::add-mask::$WATCHER_TOKEN"
+            echo "WATCHER_TOKEN=$WATCHER_TOKEN" >> "$GITHUB_ENV"
+          else
+            echo "WATCHER_TOKEN=" >> "$GITHUB_ENV"
+          fi
+
       - name: Compute facts block (deterministic — before any model runs)
         id: facts
         env:
@@ -550,6 +566,9 @@ jobs:
           DEL=$(python3 -c "import json;print(json.load(open('/tmp/facts.json'))['deletions'])")
           echo "diff_lines=$((ADD + DEL))" >> "$GITHUB_OUTPUT"
 
+      - name: Install Claude CLI
+        run: npm install -g @anthropic-ai/claude-code
+
       - name: Run archaeologist (pure function — NO GitHub token)
         id: recon
         env:
@@ -557,6 +576,7 @@ jobs:
           ISSUE_NUMBER: ${{ needs.classify.outputs.stub_number }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           DIFF_LINES: ${{ steps.facts.outputs.diff_lines }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # NOTE: GITHUB_TOKEN intentionally absent (SPEC.md §12.6.1).
         run: |
           if [ "$DIFF_LINES" -gt "$INTAKE_MAX_DIFF_LINES" ]; then
@@ -579,7 +599,7 @@ jobs:
           WATCHER_APP_ID: ${{ secrets.WATCHER_APP_ID }}
           WATCHER_PRIVATE_KEY: ${{ secrets.WATCHER_PRIVATE_KEY }}
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ env.WATCHER_TOKEN || secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
             const { owner, repo } = context.repo;
@@ -712,8 +732,7 @@ jobs:
                 '',
                 '### Actions',
                 '- `/approve-intent` — the interpretation matches the actual intent; proceed to review',
-                '- `/request-changes <notes>` — send back for another pass',
-                '- `/dismiss-findings <category> --reason <text>` — dismiss a findings category (recorded)'
+                '- `/request-changes <notes>` — send back for another pass'
               ].join('\n')
             });
 
@@ -737,13 +756,38 @@ jobs:
       pull-requests: read
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install script dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Mint watcher token
+        id: mint-token
+        env:
+          WATCHER_APP_ID: ${{ secrets.WATCHER_APP_ID }}
+          WATCHER_PRIVATE_KEY: ${{ secrets.WATCHER_PRIVATE_KEY }}
+        run: |
+          if [ -n "$WATCHER_APP_ID" ]; then
+            WATCHER_TOKEN=*** scripts/github_token.py watcher)
+            echo "::add-mask::$WATCHER_TOKEN"
+            echo "WATCHER_TOKEN=*** >> "$GITHUB_ENV"
+          else
+            echo "WATCHER_TOKEN=*** >> "$GITHUB_ENV"
+          fi
+
       - name: Verify and transition
         uses: actions/github-script@v7
         env:
           APPROVER_LEVELS: ${{ env.GOVERNANCE_APPROVERS }}
           APPROVE_SELF: ${{ env.INTAKE_APPROVE_INTENT_SELF }}
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ env.WATCHER_TOKEN || secrets.GITHUB_TOKEN }}
           script: |
             const { owner, repo } = context.repo;
             const issue_number = context.payload.issue.number;

@@ -18,3 +18,14 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
       - run: pytest
+      - name: Check template-tree sync (templates/ == bootstrap/templates/)
+        run: |
+          # templates/ and bootstrap/templates/ must stay identical.
+          # Drift between them was the root cause of the v1.2.1 patch (ba0e17c)
+          # and F9.1 in the v1.2.2 fix spec. This check retires the class.
+          if ! diff -rq templates/ bootstrap/templates/ > /dev/null 2>&1; then
+            echo "ERROR: templates/ and bootstrap/templates/ have drifted."
+            diff -rq templates/ bootstrap/templates/
+            exit 1
+          fi
+          echo "OK: templates/ and bootstrap/templates/ are identical."
