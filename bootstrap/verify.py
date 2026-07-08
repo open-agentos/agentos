@@ -235,6 +235,70 @@ def _check_board(spec: dict, bindings_path: Optional[Path], token: Optional[str]
 # Public verifier
 # ---------------------------------------------------------------------------
 
+def _check_no_app_roles(spec: dict, repo: str, token: str) -> list[Check]:
+    """F10.2: warn if a GitHub App is installed for a role declared create_app: false.
+
+    The archaeologist (and any other role with create_app: false) must NOT have
+    a GitHub App — that's a deliberate security property (SPEC.md §13). An
+    operator who provisions one by pattern defeats the containment silently.
+    This check detects it.
+
+    We look for Apps whose slug contains the role id (case-insensitive).
+    This is heuristic — GitHub doesn't expose a direct slug→app lookup for
+    arbitrary installations — but it catches the field pattern (an App named
+    'myorg-archaeologist' provisioned for the archaeologist role).
+    """
+    agents = spec.get("agents", [])
+    no_app_roles = [a["id"] for a in agents if not a.get("create_app", True)]
+    if not no_app_roles:
+        return []
+
+    checks: list[Check] = []
+    try:
+        # List all Apps installed on the repo.
+        resp = requests.get(
+            f"{GITHUB_API}/repos/{repo}/installation",
+            headers=_rest_headers(token),
+            timeout=20,
+        )
+        # The /installation endpoint returns the single installation; to list
+        # all Apps on the repo we use the repo installations endpoint.
+        installations_resp = requests.get(
+            f"{GITHUB_API}/repos/{repo}/installations",
+            headers=_rest_headers(token),
+            timeout=20,
+        )
+        if installations_resp.status_code != 200:
+            # Can't verify — not a failure, just skip.
+            return []
+        installed_slugs = [
+            inst.get("app_slug", "").lower()
+            for inst in installations_resp.json()
+        ]
+    except Exception:
+        return []
+
+    for role_id in no_app_roles:
+        matching = [s for s in installed_slugs if role_id in s]
+        if matching:
+            checks.append(Check(
+                f"no-app-role:{role_id}",
+                False,
+                f"SECURITY WARNING: role '{role_id}' is declared create_app: false "
+                f"(SPEC.md §13 — no App identity), but an installed App with matching slug "
+                f"was found: {matching}. This silently defeats the containment design. "
+                f"Uninstall or remove permissions from this App.",
+            ))
+        else:
+            checks.append(Check(
+                f"no-app-role:{role_id}",
+                True,
+                f"no App found for no-App role '{role_id}' (correct)",
+            ))
+
+    return checks
+
+
 def verify(
     spec: dict[str, Any],
     repo: str,
@@ -260,5 +324,6 @@ def verify(
     result.checks += _check_labels(spec, repo, token)
     result.checks += _check_workflows(spec, repo, token)
     result.checks += _check_board(spec, effective_bindings, board_token or token)
+    result.checks += _check_no_app_roles(spec, repo, token)
 
     return result
