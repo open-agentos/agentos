@@ -29,3 +29,7 @@ jobs:
             exit 1
           fi
           echo "OK: templates/ and bootstrap/templates/ are identical."
+      - name: Check runner prerequisites (F9.4 — every agent runner job needs Claude CLI install)
+        run: python3 scripts/check_runner_prereqs.py
+      - name: Check install version references match pyproject.toml (#35)
+        run: python3 scripts/check_version_refs.py
