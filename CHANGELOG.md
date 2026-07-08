@@ -10,7 +10,79 @@ version. Each major bump ships a corresponding MIGRATION-vN.md in the repo root.
 
 ---
 
+## [1.2.2] — 2026-07-08
+
+Patch release. Fixes five field failures discovered during end-to-end intake
+testing on `agentos-hello-world`. The hello-world deployment was the discovery
+vehicle for all five; every change here was proven in that environment before
+being ported to this template.
+
+`specVersion` stays `"1.2"` — patch release, no spec-surface change.
+
+### Fixed
+
+- **F2 — Archaeologist job missing `permissions:` block** (P0) — the
+  archaeologist job in `bootstrap/templates/workflows/agent-intake.yml` had
+  no `permissions:` block. On repos with default read-only workflow tokens
+  (GitHub's default for new repos), every reconstruction write failed silently
+  and wild PRs stalled at `status:intake` with a green job. Added
+  `{issues: write, pull-requests: read, contents: read}`.
+
+- **F9 — Archaeologist job missing its runner prerequisites** — the
+  archaeologist job was scaffolded by copying the `{{AGENT_RUNNER}}` pattern
+  from `agent-orchestrator.yml` without carrying its prerequisites. Three
+  sequential field failures, same root cause: (1) `agents/archaeologist/AGENT.md`
+  was not in the bootstrap template set — now added to `bootstrap/templates/agents/`
+  (it was already there but this confirms it); (2) `claude: command not found` —
+  no CLI install step; fixed by adding `Install Claude CLI` step before the
+  runner; (3) `Not logged in` — `ANTHROPIC_API_KEY` was not injected into the
+  `Run archaeologist` step's `env:` block; fixed.
+
+- **F11 — Intake→planned handoff is silent** (P0) — `/approve-intent`'s
+  `Verify and transition` step used `github-token: secrets.GITHUB_TOKEN`
+  directly. GitHub does not fire new workflow runs for API writes authenticated
+  with the default `GITHUB_TOKEN` (loop-prevention, platform-level). The
+  orchestrator's `issues.labeled` trigger on `status:in-review` therefore never
+  fired, making wild PRs invisible to review indefinitely with no error and a
+  label that looked correct. Fixed by adding Checkout, Python, script-deps, and
+  `Mint watcher token` steps to `approve-intent`, matching `classify`'s pattern,
+  and switching `github-token:` to `${{ env.WATCHER_TOKEN || secrets.GITHUB_TOKEN }}`.
+
+- **F4.2 — Remove `/dismiss-findings` from comment templates** — the stub body
+  and intake-review comment advertised `/dismiss-findings`; no handler exists.
+  Removed from both templates. The command returns in v1.3 with a real handler.
+
+- **Watcher App permission** — added `pull_requests: write` to the watcher role
+  in `agentOS.yaml`. Without it, the closing-link write (`Closes #N` on the PR
+  body) failed silently, breaking stub dedupe and merge-settlement.
+
+### Added
+
+- **`docs/intake.md`** — full intake feature documentation (the YOLO lane),
+  including the state machine, security model, setup requirements, configuration
+  reference, and current limitations.
+
+- **`type:docs` label** — added to the type axis so the archaeologist's
+  `proposed_type: "docs"` lands on the correct label instead of degrading to
+  `type:chore`.
+
+- **`agentOS.yaml` archaeologist comment block** — added a `DELIBERATE EXCEPTION`
+  comment adjacent to `create_app: false` explaining the confused-deputy
+  rationale in one sentence. Operators setting up by pattern were creating a
+  fifth App for the archaeologist, silently defeating the security guarantee.
+
+- **README intake section** — one-line callout ("the archaeologist has no
+  GitHub App by design — this is not a step you missed") plus the three intake
+  setup requirements new operators need.
+
+- **CI template-tree drift check** — `diff -r templates/ bootstrap/templates/`
+  added to `test.yml`. Drift between the two trees was the root cause of the
+  v1.2.1 patch (ba0e17c) and F9.1; this check retires the class permanently.
+
+---
+
 ## [1.2.1] — 2026-07-03
+
 
 Patch release. Fixes three bugs in `agent-intake.yml` discovered when
 running the intake workflow against a repo with no GitHub Apps configured.

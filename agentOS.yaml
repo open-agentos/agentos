@@ -67,6 +67,9 @@ agents:
     create_app: true
     permissions:
       issues: write
+      pull_requests: write      # Intake closing-link writes (SPEC.md §12.4.1).
+                                # Without this, stub dedupe and merge-settlement
+                                # silently fail — see v1.2.2 release notes.
       metadata: read
     triggers: []              # Invoked by schedule or settlement, not labels
     branch_prefix: "agent/watcher/"
@@ -134,6 +137,11 @@ agents:
       out. Holds NO GitHub token and has NO App identity — the orchestrator
       performs every side effect on its behalf. The runner MUST NOT grant it
       shell execution, network access, or any tool with side effects.
+    # DELIBERATE EXCEPTION — do NOT create a GitHub App for this role.
+    # GitHub permissions are not row-level: any issues:write token can edit
+    # every issue in the repo. The archaeologist consumes untrusted input;
+    # mediated writes via the watcher token are its containment (SPEC.md §13).
+    # Provisioning an App for it silently defeats that design.
     create_app: false           # Intentionally no App: mediated writes only
     triggers:
       - status:intake           # Dispatched after janitors settle and tripwires pass
@@ -416,6 +424,10 @@ labels:
       - name: chore
         color: "fef2c0"
         description: "Maintenance, dependency update, or refactor"
+
+      - name: docs
+        color: "fef2c0"
+        description: "Documentation change"
 
       - name: question
         color: "d876e3"

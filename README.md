@@ -81,10 +81,29 @@ Then label an issue `type:feature` + `status:todo` and watch the PR open. Full w
 - [Getting Started](./docs/getting-started.md) — first run in ~30 minutes
 - [Agent Roles](./docs/agent-roles.md) — identities, permissions, the runner interface
 - [Label Model](./docs/label-model.md) — the state machine behind the labels
+- [Intake: the YOLO lane](./docs/intake.md) — unplanned PRs, wild classification, `/approve-intent`
 - [Metrics Schema](./docs/metrics-schema.md) — the run-record corpus
 - [Specification](./SPEC.md) — the normative reference
 - [Uninstall](./docs/uninstall.md) — how to remove agentOS from a repo
 - [DIY AgentOS](./docs/diy-agentos.md) — build your own agent loop
+
+## Intake setup requirements (v1.2+)
+
+Three extra steps beyond a standard agentOS install if you want the wild-PR
+pipeline to work end to end:
+
+1. `ANTHROPIC_API_KEY` repo secret — the archaeologist needs it to run.
+2. Watcher App must have **Pull requests: Read and write** — it writes the
+   `Closes #N` link that stub dedupe and merge-settlement depend on.
+   `agentOS upgrade` will tell you if it's missing.
+3. `agents/archaeologist/AGENT.md` in the repo — installed automatically
+   by `agentOS init` from v1.2.2 onward.
+
+> **The archaeologist has no GitHub App by design — this is not a step you
+> missed.** It is the only role without an App identity; see
+> [docs/intake.md](./docs/intake.md#setup-requirements) and SPEC.md §13
+> for why. `agentOS verify` will warn if an App for it is found.
+
 
 ## License
 
