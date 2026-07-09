@@ -129,8 +129,17 @@ jobs:
             core.setOutput('is_fork', String(pr.head.repo?.full_name !== `${owner}/${repo}`));
             core.setOutput('is_draft', String(pr.draft === true));
 
-            if ((process.env.INTAKE_ENABLED || 'true') !== 'true') {
-              console.log('Intake disabled — skipping.');
+            // F8: tolerant INTAKE_ENABLED parse (accepts true/1/yes, case-insensitive).
+            const intakeEnabledRaw = (process.env.INTAKE_ENABLED || 'true').trim().toLowerCase();
+            const intakeEnabled = ['true', '1', 'yes'].includes(intakeEnabledRaw);
+            if (!intakeEnabled) {
+              const summary = `intake disabled via INTAKE_ENABLED=${process.env.INTAKE_ENABLED}`;
+              console.log(summary);
+              const stepSummary = process.env.GITHUB_STEP_SUMMARY;
+              if (stepSummary) {
+                const fs = require('fs');
+                fs.appendFileSync(stepSummary, `## Classify verdict\n\n**disabled** — ${summary}\n`);
+              }
               return;
             }
 
@@ -175,11 +184,15 @@ jobs:
             // Rule 1: author is not an agentOS App identity.
             if (isAgentIdentity(author)) {
               console.log(`Author '${author}' is an agentOS App — not wild.`);
+              core.summary.addRaw(`## Classify verdict\n\n**not wild** — author \`${author}\` is an agentOS App identity\n`);
+              await core.summary.write();
               return;
             }
             // Rule 2: author is not excluded.
             if (EXCLUDE_ACTORS.includes(author)) {
               console.log(`Author '${author}' is in exclude_actors — intake ignores this PR.`);
+              core.summary.addRaw(`## Classify verdict\n\n**excluded** — author \`${author}\` is in \`INTAKE_EXCLUDE_ACTORS\`\n\n⚠ If this is your own username, remove it from the list.\n`);
+              await core.summary.write();
               return;
             }
             // Rule 3: no closing-linked issue (closingIssuesReferences covers
@@ -206,6 +219,24 @@ jobs:
 
             if (nonStubLinks.length > 0) {
               console.log('PR has a closing-linked (non-stub) issue — planned work, not wild.');
+              core.summary.addRaw(`## Classify verdict\n\n**not wild** — PR #${prNumber} has a closing-linked issue (planned work)\n`);
+              await core.summary.write();
+              // F7: if a marker-stub exists, close it with an explanatory comment.
+              // Without this, the stub would sit open at status:intake forever.
+              if (existingStub || markerStub) {
+                const orphanNumber = (existingStub || markerStub).number;
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: orphanNumber,
+                  body: [
+                    'A real issue has been linked to the pull request — intake withdraws.',
+                    `PR #${prNumber} now closes a non-stub issue; this stub is no longer needed.`,
+                    'Closing automatically (SPEC.md §12.4.3).'
+                  ].join('\n')
+                });
+                await github.rest.issues.update(
+                  { owner, repo, issue_number: orphanNumber, state: 'closed' });
+                console.log(`Closed orphan stub #${orphanNumber} — real issue linked.`);
+              }
               // linked_prs: janitors-report-only is handled by the janitors job
               // reading this output; ignore means intake does not touch the PR.
               return;
@@ -214,9 +245,44 @@ jobs:
             core.setOutput('wild', 'true');
             console.log(`PR #${prNumber} classified WILD.`);
 
+            // ---- Tripwires (§12.6.2) — deterministic, BEFORE any agent or stub ----
+            // F3: evaluate tripwires for drafts too, before the draft early-return.
+            // A draft wild PR editing agentOS.yaml could execute attacker-chosen janitor
+            // commands if tripwires were only checked after the draft guard.
+            const files = await github.paginate(github.rest.pulls.listFiles,
+              { owner, repo, pull_number: prNumber, per_page: 100 });
+            // Minimal glob→regex: '**' crosses directories, '*' does not.
+            function globToRe(glob) {
+              let re = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+              re = re.replace(/\*\*/g, '\u0001').replace(/\*/g, '[^/]*')
+                     .replace(/\u0001/g, '.*');
+              return new RegExp(`^${re}$`);
+            }
+            const tripwireRes = TRIPWIRE_PATHS.map(globToRe);
+            const tripped = files.filter(f =>
+              tripwireRes.some(re => re.test(f.filename)));
+
             // ---- Draft PRs (§12.2.3): report janitors only; no stub yet ----
             if (pr.draft === true) {
+              if (tripped.length > 0) {
+                // Draft + tripwire: comment on the PR (no stub yet), no janitor run.
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: prNumber,
+                  body: [
+                    '**Tripwire — human eyes mandatory (draft).** This draft wild PR touches protected paths:',
+                    '',
+                    ...tripped.map(f => `- \`${f.filename}\``),
+                    '',
+                    'No reconstruction or autofix will run (SPEC.md §12.6.2). A stub will not',
+                    'be created until the PR is ready for review and the protected paths are removed.'
+                  ].join('\n')
+                });
+                core.setOutput('tripwired', 'true');
+                console.log('Draft tripwire matched — no stub, no janitors.');
+              }
               console.log('Draft PR — report-mode janitors only; stub waits for ready_for_review.');
+              core.summary.addRaw(`## Classify verdict\n\n**wild (draft)** — PR #${prNumber} by \`${author}\` — janitors only, stub deferred until ready_for_review\n`);
+              await core.summary.write();
               return;
             }
 
@@ -237,13 +303,39 @@ jobs:
             }
 
             // ---- Stub creation / reuse (§12.4.1) — idempotent ----
+            // F1: discovery uses machine marker first, closingIssuesReferences is
+            // only the settlement mechanism. Search open+closed issues for the marker.
             let stubNumber;
-            if (existingStub) {
-              stubNumber = existingStub.number;
+            let markerStub = null;
+            const markerQuery = `
+              query($owner: String!, $repo: String!, $q: String!) {
+                search(type: ISSUE, query: $q, first: 5) {
+                  nodes { ... on Issue { number state labels(first: 20) { nodes { name } } } }
+                }
+              }`;
+            const markerData = await github.graphql(markerQuery, {
+              owner, repo,
+              q: `repo:${owner}/${repo} in:body agentOS:intake-pr:${prNumber}`
+            });
+            const markerHits = markerData.search.nodes.filter(n =>
+              n.labels?.nodes?.some(l => l.name === 'source:wild'));
+            if (markerHits.length > 0) {
+              markerStub = markerHits[0];
+            }
+
+            if (markerStub || existingStub) {
+              stubNumber = (markerStub || existingStub).number;
               console.log(`Reusing existing stub #${stubNumber}.`);
-              // Reopen if a human closed it mid-intake or after cancellation (§12.4.2).
               const { data: stub } = await github.rest.issues.get(
                 { owner, repo, issue_number: stubNumber });
+              // F1: orphan adoption — marker-stub with no status:* label gets status:intake.
+              const stubLabels = stub.labels.map(l => l.name);
+              if (!stubLabels.some(l => l.startsWith('status:'))) {
+                console.log(`Stub #${stubNumber} has no status label (orphan) — applying status:intake.`);
+                await github.rest.issues.addLabels(
+                  { owner, repo, issue_number: stubNumber, labels: ['status:intake'] });
+              }
+              // Reopen if a human closed it mid-intake or after cancellation (§12.4.2).
               if (stub.state === 'closed' && pr.state === 'open') {
                 await github.rest.issues.update(
                   { owner, repo, issue_number: stubNumber, state: 'open' });
@@ -260,6 +352,7 @@ jobs:
             } else {
               const title = pr.title?.trim() || pr.head.ref;
               const body = [
+                `<!-- agentOS:intake-pr:${prNumber} -->`,
                 '> **System notice:** this issue is intake-managed (agentOS wild lane,',
                 `> SPEC.md §12). It was created automatically from PR #${prNumber}, which`,
                 '> has no linked issue. Interact via `/approve-intent`,',
@@ -280,60 +373,48 @@ jobs:
               // GitHub blocks PATCH /pulls and POST /issues/{pr}/comments via the
               // fallback GITHUB_TOKEN on synchronize events regardless of the
               // permissions block — this is a platform restriction, not a config gap.
-              // When no App is configured, skip both writes gracefully; the stub
-              // issue itself records the classification and is sufficient for tracking.
-              if (process.env.WATCHER_TOKEN) {
-                // Closing-link the PR to the stub (§12.4.1 step 3)
-                const prBody = pr.body || '';
-                if (!prBody.includes(`Closes #${stubNumber}`)) {
-                  try {
-                    await github.rest.pulls.update({
-                      owner, repo, pull_number: prNumber,
-                      body: `Closes #${stubNumber}\n\n${prBody}`
-                    });
-                  } catch (e) {
-                    console.log(`Could not update PR body (${e.status}): ${e.message}`);
-                  }
-                }
+              // F1: closing-link write is MUST-succeed — no graceful skip. If it fails,
+              // stub dedupe and merge-settlement are broken.
+              if (!process.env.WATCHER_TOKEN) {
+                core.setFailed(
+                  'WATCHER_TOKEN is not set — cannot write Closes #N closing link. ' +
+                  'Intake requires the watcher App with pull_requests:write permission. ' +
+                  'See SPEC.md §12.4.1 and the v1.2.2 release notes.'
+                );
+                return;
+              }
 
-                // First PR comment (§12.4.1 step 4)
-                try {
-                  await github.rest.issues.createComment({
-                    owner, repo, issue_number: prNumber,
-                    body: [
-                      `This pull request has no linked issue, so agentOS intake created stub issue #${stubNumber} to track it.`,
-                      '',
-                      '**What happens next:**',
-                      '1. Deterministic janitors run against this branch (report mode posts check runs; autofix mode, if enabled, pushes formatting-class commits).',
-                      '2. The archaeologist reconstructs the intent of this change into the stub issue.',
-                      '3. A maintainer reviews the reconstruction and comments `/approve-intent`, after which the normal review loop begins.',
-                      '',
-                      '> **Tip:** if autofix janitors are enabled they may push commits to this branch. Use `git pull --rebase` before pushing again.'
-                    ].join('\n')
-                  });
-                } catch (e) {
-                  console.log(`Could not post PR comment (${e.status}): ${e.message}`);
-                }
-              } else {
-                console.log('No watcher App token — skipping PR body update and comment (requires App token to write to PRs on synchronize events).');
+              // Closing-link the PR to the stub (§12.4.1 step 3) — MUST succeed.
+              const prBody = pr.body || '';
+              if (!prBody.includes(`Closes #${stubNumber}`)) {
+                await github.rest.pulls.update({
+                  owner, repo, pull_number: prNumber,
+                  body: `Closes #${stubNumber}\n\n${prBody}`
+                });
+              }
+
+              // First PR comment (§12.4.1 step 4)
+              try {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: prNumber,
+                  body: [
+                    `This pull request has no linked issue, so agentOS intake created stub issue #${stubNumber} to track it.`,
+                    '',
+                    '**What happens next:**',
+                    '1. Deterministic janitors run against this branch (report mode posts check runs; autofix mode, if enabled, pushes formatting-class commits).',
+                    '2. The archaeologist reconstructs the intent of this change into the stub issue.',
+                    '3. A maintainer reviews the reconstruction and comments `/approve-intent`, after which the normal review loop begins.',
+                    '',
+                    '> **Tip:** if autofix janitors are enabled they may push commits to this branch. Use `git pull --rebase` before pushing again.'
+                  ].join('\n')
+                });
+              } catch (e) {
+                console.log(`Could not post PR comment (${e.status}): ${e.message}`);
               }
             }
             core.setOutput('stub_number', String(stubNumber));
 
-            // ---- Tripwires (§12.6.2) — deterministic, BEFORE any agent ----
-            const files = await github.paginate(github.rest.pulls.listFiles,
-              { owner, repo, pull_number: prNumber, per_page: 100 });
-            // Minimal glob→regex: '**' crosses directories, '*' does not.
-            function globToRe(glob) {
-              let re = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-              re = re.replace(/\*\*/g, '\u0001').replace(/\*/g, '[^/]*')
-                     .replace(/\u0001/g, '.*');
-              return new RegExp(`^${re}$`);
-            }
-            const tripwireRes = TRIPWIRE_PATHS.map(globToRe);
-            const tripped = files.filter(f =>
-              tripwireRes.some(re => re.test(f.filename)));
-
+            // ---- Tripwires for non-draft (§12.6.2) — files/tripped computed above ----
             if (tripped.length > 0) {
               await setStatus(stubNumber, 'status:blocked');
               await github.rest.issues.createComment({
@@ -358,6 +439,10 @@ jobs:
             // opened, reopened, ready_for_review, author synchronize, base retarget.
             await setStatus(stubNumber, 'status:intake');
             console.log(`Stub #${stubNumber} at status:intake.`);
+
+            // F8: step summary verdict — one line, always.
+            core.summary.addRaw(`## Classify verdict\n\n**wild** — PR #${prNumber} by \`${author}\` → stub #${stubNumber} at \`status:intake\`\n`);
+            await core.summary.write();
 
   # ---------------------------------------------------------------------------
   # janitors — the janitor layer (SPEC.md §12.5)
@@ -390,6 +475,14 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
+      # F3 (security): fetch agentOS.yaml from the base ref so janitor commands
+      # always come from trusted configuration, never from the PR head.
+      # SECURITY INVARIANT: janitor config is never read from contributed code.
+      - name: Fetch agentOS.yaml from base ref
+        run: |
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+          git show origin/${{ github.event.pull_request.base.ref }}:agentOS.yaml > /tmp/agentOS-base.yaml
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -412,12 +505,14 @@ jobs:
           IS_DRAFT: ${{ needs.classify.outputs.is_draft }}
           STUB_NUMBER: ${{ needs.classify.outputs.stub_number }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          JANITOR_APP_ID: ${{ secrets.JANITOR_APP_ID }}
-          JANITOR_PRIVATE_KEY: ${{ secrets.JANITOR_PRIVATE_KEY }}
+          # F3: JANITOR_APP_ID/JANITOR_PRIVATE_KEY removed from executor env until
+          # autofix push ships in v1.3. They are unused here (pure exposure).
           GITHUB_RUN_ID_VAL: ${{ github.run_id }}
         run: |
           python3 - <<'RUN_JANITORS'
-          # Reference janitor executor. Reads intake.janitors from agentOS.yaml,
+          # Reference janitor executor. Reads intake.janitors from agentOS.yaml
+          # at the BASE REF (written to /tmp/agentOS-base.yaml by the prior step),
+          # never from the PR head — janitor commands always come from trusted config.
           # runs each serially. Report mode: collect findings for the facts
           # block (emitted as the job log + step summary; check-run publication
           # uses the janitor App when configured). Autofix mode: run tool,
@@ -433,7 +528,7 @@ jobs:
 
           try:
               import yaml
-              spec = yaml.safe_load(pathlib.Path("agentOS.yaml").read_text())
+              spec = yaml.safe_load(pathlib.Path("/tmp/agentOS-base.yaml").read_text())
           except Exception:
               spec = {}
           intake = (spec or {}).get("intake", {}) or {}
@@ -831,7 +926,10 @@ jobs:
                   issue(number: $issue) {
                     closedByPullRequestsReferences(first: 5, includeClosedPrs: false) {
                       nodes { number headRefOid author { login }
-                              commits(last: 1) { nodes { commit { committedDate } } } }
+                              headRef { target { ... on Commit { pushedDate } } }
+                              timelineItems(last: 10, itemTypes: [HEAD_REF_PUSHED_EVENT]) {
+                                nodes { ... on HeadRefPushedEvent { createdAt } }
+                              } }
                     }
                   }
                 }
@@ -853,7 +951,16 @@ jobs:
 
             // Staleness (§12.7.4): approval must postdate the latest push —
             // author or janitor. Ties resolve to invalid.
-            const lastPushAt = new Date(pr.commits.nodes[0]?.commit.committedDate || 0);
+            // F5: use pushedDate (head ref push time) with fallback to last
+            // HEAD_REF_PUSHED_EVENT timeline entry. Rebased/backdated commits
+            // (committedDate) no longer defeat this check.
+            const pushedDate = pr.headRef?.target?.pushedDate;
+            const timelineEvents = pr.timelineItems?.nodes || [];
+            const lastTimelinePush = timelineEvents.length > 0
+              ? timelineEvents[timelineEvents.length - 1].createdAt
+              : null;
+            const lastPushStr = pushedDate || lastTimelinePush;
+            const lastPushAt = new Date(lastPushStr || 0);
             if (commentAt <= lastPushAt) {
               await refuse([
                 `@${commenter} — approval invalid: the branch was pushed at or after your`,

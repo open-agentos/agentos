@@ -18,7 +18,7 @@ uv tool install open-agentos-cli
 
 # 2. Pull the framework into a repo
 cd my-agent-repo
-agentOS init --from github:open-agentos/agentos@v1.2.0
+agentOS init --from github:open-agentos/agentos@v1.2.3
 
 # 3. Export GITHUB_TOKEN (required for the apply step)
 export GITHUB_TOKEN=$(gh auth token)
@@ -107,7 +107,7 @@ The same steps, with what each one does.
 
 ```bash
 uv tool install open-agentos-cli
-agentOS init --from github:open-agentos/agentos@v1.2.0
+agentOS init --from github:open-agentos/agentos@v1.2.3
 ```
 
 `init` fetches the canonical `agentOS.yaml` from the agentos repo, writes it locally, and creates a `.agentOS/` scaffold whose `keys/` directory is git-ignored. Pin to a tag rather than `@main` so a later change can't alter your label model without you asking for it.

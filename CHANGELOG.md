@@ -10,6 +10,66 @@ version. Each major bump ships a corresponding MIGRATION-vN.md in the repo root.
 
 ---
 
+## [1.2.3] — 2026-07-08
+
+Patch release. Fixes and hardening across the intake pipeline, all proven
+by the v1.2.2 field cycle. `specVersion` stays `"1.2"`.
+
+### Fixed
+
+- **F1 — Machine marker + MUST-succeed closing link + orphan adoption** —
+  stub body now includes `<!-- agentOS:intake-pr:<N> -->` at creation;
+  discovery searches for this marker first (GraphQL) so stub reuse survives
+  link failures. Closing-link write is now `core.setFailed` on missing
+  `WATCHER_TOKEN`, not a silent skip. Marker-stubs with no `status:*` label
+  are auto-adopted to `status:intake` on the next classify run.
+
+- **F3 — Draft tripwires + base-ref janitor config (security)** — tripwires
+  are now evaluated before the draft early-return guard, closing the hole
+  where a draft wild PR could execute attacker-chosen janitor commands. Janitor
+  executor reads `agentOS.yaml` from the base ref (new `Fetch agentOS.yaml
+  from base ref` step), never from the PR head. `JANITOR_APP_ID`/
+  `JANITOR_PRIVATE_KEY` removed from the executor step env (unused until
+  autofix ships in v1.3 — pure exposure).
+
+- **F5 — Staleness check uses push time** — `approve-intent` staleness check
+  now uses `headRef.target.pushedDate` with a `HEAD_REF_PUSHED_EVENT` timeline
+  fallback. Rebased or backdated commits no longer defeat the check.
+
+- **F7 — Wild→planned stub auto-closed** — when classify finds a non-stub
+  closing link on a PR that already has a marker-stub, the stub is now closed
+  with an explanatory comment ("intake withdraws") instead of being orphaned.
+
+- **F8 — Classification observability** — `INTAKE_ENABLED` now parsed
+  tolerantly (case-insensitive, accepts `true`/`1`/`yes`). A step summary
+  verdict line is written on every classify path: disabled, not-wild (agent /
+  excluded / planned), wild-draft, wild+tripwire, and wild with stub number.
+  The excluded-actor warning flags non-bot logins explicitly.
+
+### Added
+
+- **F10.2 — `agentOS verify` warns on Apps for no-App roles** — new
+  `_check_no_app_roles()` check detects installed Apps whose slug matches a
+  role declared `create_app: false`. Emits a `SECURITY WARNING` with
+  remediation instructions (SPEC.md §13).
+
+- **F11.3 — Token-write audit** — `scripts/audit_token_writes.py` static
+  analysis wired into CI. Flags any non-orchestrator job that writes a
+  `status:*` label with bare `GITHUB_TOKEN` — the class of bug fixed in
+  v1.2.2 F11. Currently clean; will catch future regressions.
+
+- **F9.4 — Runner prerequisites smoke check** — `scripts/check_runner_prereqs.py`
+  asserts every workflow job that invokes the agent runner has a Claude CLI
+  install step preceding it. Catches the class of bug from v1.2.2 F9 (three
+  sequential field failures, same root cause each time).
+
+- **Version reference check** — `scripts/check_version_refs.py` asserts
+  install references in `README.md` and `docs/getting-started.md` match
+  `pyproject.toml`. Wired into CI; prevents stale version strings surviving
+  into a release.
+
+---
+
 ## [1.2.2] — 2026-07-08
 
 Patch release. Fixes five field failures discovered during end-to-end intake
