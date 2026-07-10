@@ -49,6 +49,13 @@ jobs:
     outputs:
       agent_role: ${{ steps.identity.outputs.agent_role }}
       issue_number: ${{ steps.identity.outputs.issue_number }}
+      duration_s: ${{ steps.usage.outputs.duration_s }}
+      tokens_in: ${{ steps.usage.outputs.tokens_in }}
+      tokens_out: ${{ steps.usage.outputs.tokens_out }}
+      cache_write: ${{ steps.usage.outputs.cache_write }}
+      cache_read: ${{ steps.usage.outputs.cache_read }}
+      cost_usd: ${{ steps.usage.outputs.cost_usd }}
+      turns: ${{ steps.usage.outputs.turns }}
 
     env:
       LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
@@ -406,7 +413,8 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Run agent
         if: env.AGENT_ROLE != 'skip'
-        run: '{{AGENT_RUNNER}}'
+        run: |
+          {{AGENT_RUNNER}} | tee /tmp/agent-result.json
         env:
           AGENT_ROLE: ${{ env.AGENT_ROLE }}
           ISSUE_NUMBER: ${{ env.ISSUE_NUMBER }}
@@ -423,6 +431,23 @@ jobs:
         run: |
           echo "agent_role=${AGENT_ROLE:-}" >> "$GITHUB_OUTPUT"
           echo "issue_number=${ISSUE_NUMBER:-}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract usage
+        id: usage
+        if: always() && env.AGENT_ROLE != 'skip'
+        run: |
+          F=/tmp/agent-result.json
+          if [ -s "$F" ] && jq -e . "$F" >/dev/null 2>&1; then
+            {
+              echo "tokens_in=$(jq -r '.usage.input_tokens // 0' "$F")"
+              echo "tokens_out=$(jq -r '.usage.output_tokens // 0' "$F")"
+              echo "cache_write=$(jq -r '.usage.cache_creation_input_tokens // 0' "$F")"
+              echo "cache_read=$(jq -r '.usage.cache_read_input_tokens // 0' "$F")"
+              echo "cost_usd=$(jq -r '.total_cost_usd // 0 | tostring' "$F")"
+              echo "turns=$(jq -r '.num_turns // 0' "$F")"
+              echo "duration_s=$(jq -r '((.duration_ms // 0) / 1000 | round)' "$F")"
+            } >> "$GITHUB_OUTPUT"
+          fi
 
   # ---------------------------------------------------------------------------
   # plan-orchestrator — dispatches planner with a per-issue concurrency group
@@ -515,6 +540,13 @@ jobs:
       job_status: ${{ needs.orchestrate.result }}
       agent_role: ${{ needs.orchestrate.outputs.agent_role }}
       issue_number: ${{ needs.orchestrate.outputs.issue_number }}
+      duration_s: ${{ needs.orchestrate.outputs.duration_s }}
+      tokens_in: ${{ needs.orchestrate.outputs.tokens_in }}
+      tokens_out: ${{ needs.orchestrate.outputs.tokens_out }}
+      cache_write: ${{ needs.orchestrate.outputs.cache_write }}
+      cache_read: ${{ needs.orchestrate.outputs.cache_read }}
+      cost_usd: ${{ needs.orchestrate.outputs.cost_usd }}
+      turns: ${{ needs.orchestrate.outputs.turns }}
     secrets: inherit
 
   # ---------------------------------------------------------------------------
