@@ -46,6 +46,10 @@ jobs:
     permissions:
       issues: write
 
+    outputs:
+      agent_role: ${{ steps.identity.outputs.agent_role }}
+      issue_number: ${{ steps.identity.outputs.issue_number }}
+
     env:
       LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
       LLM_MODEL: ${{ vars.LLM_MODEL }}
@@ -400,6 +404,13 @@ jobs:
           LLM_API_KEY: ${{ env.LLM_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
+      - name: Expose run identity for receipt
+        id: identity
+        if: always()
+        run: |
+          echo "agent_role=${AGENT_ROLE:-}" >> "$GITHUB_OUTPUT"
+          echo "issue_number=${ISSUE_NUMBER:-}" >> "$GITHUB_OUTPUT"
+
   # ---------------------------------------------------------------------------
   # plan-orchestrator — dispatches planner with a per-issue concurrency group
   # This is a separate job so the concurrency key can include the issue number.
@@ -478,6 +489,8 @@ jobs:
     uses: ./.github/workflows/run-receipt.yml
     with:
       job_status: ${{ needs.orchestrate.result }}
+      agent_role: ${{ needs.orchestrate.outputs.agent_role }}
+      issue_number: ${{ needs.orchestrate.outputs.issue_number }}
     secrets: inherit
 
   # ---------------------------------------------------------------------------
