@@ -18,6 +18,9 @@ jobs:
     name: Escalate orchestrator failure
     runs-on: ubuntu-latest
     if: github.event.workflow_run.conclusion == 'failure'
+    permissions:
+      issues: write
+      actions: read
 
     steps:
       - name: Checkout repository
