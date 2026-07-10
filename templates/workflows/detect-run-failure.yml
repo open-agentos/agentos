@@ -38,10 +38,9 @@ jobs:
           echo "Failed workflow run: $RUN_ID"
 
           # Fetch jobs list for this run
-          JOBS_JSON=*** gh api \
+          JOBS_JSON=$(gh api \
             "repos/${{ github.repository }}/actions/runs/$RUN_ID/jobs" \
             --jq '.jobs')
-          echo "JOBS_JSON=*** >> "$GITHUB_ENV"
           echo "$JOBS_JSON" | python3 -c "
           import json, sys, os
           jobs = json.load(sys.stdin)

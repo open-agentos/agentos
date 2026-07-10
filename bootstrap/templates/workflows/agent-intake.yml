@@ -869,11 +869,11 @@ jobs:
           WATCHER_PRIVATE_KEY: ${{ secrets.WATCHER_PRIVATE_KEY }}
         run: |
           if [ -n "$WATCHER_APP_ID" ]; then
-            WATCHER_TOKEN=*** scripts/github_token.py watcher)
+            WATCHER_TOKEN=$(python3 scripts/github_token.py watcher)
             echo "::add-mask::$WATCHER_TOKEN"
-            echo "WATCHER_TOKEN=*** >> "$GITHUB_ENV"
+            echo "WATCHER_TOKEN=$WATCHER_TOKEN" >> "$GITHUB_ENV"
           else
-            echo "WATCHER_TOKEN=*** >> "$GITHUB_ENV"
+            echo "WATCHER_TOKEN=" >> "$GITHUB_ENV"
           fi
 
       - name: Verify and transition
