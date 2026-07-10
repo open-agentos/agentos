@@ -404,7 +404,7 @@ jobs:
           LLM_MODEL: ${{ env.LLM_MODEL }}
           AGENT_MAX_TURNS: ${{ env.AGENT_MAX_TURNS }}
           LLM_API_KEY: ${{ env.LLM_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY || secrets.ANTHROPIC_API_KEY }}
 
       - name: Expose run identity for receipt
         id: identity
@@ -479,7 +479,7 @@ jobs:
           LLM_MODEL: ${{ env.LLM_MODEL }}
           AGENT_MAX_TURNS: ${{ env.AGENT_MAX_TURNS }}
           LLM_API_KEY: ${{ env.LLM_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY || secrets.ANTHROPIC_API_KEY }}
 
   # ---------------------------------------------------------------------------
   # post-run-receipt — calls run-receipt.yml after orchestrate finishes
