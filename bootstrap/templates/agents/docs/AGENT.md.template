@@ -7,6 +7,16 @@ documentation files (README, API reference, CHANGELOG) to reflect the feature
 or fix that was just approved, then opens a pull request targeting the same
 base branch as the feature PR."]
 
+Environment variables injected by the orchestrator:
+
+    ISSUE_NUMBER        The issue whose approved feature you must document
+    GITHUB_TOKEN        Docs App installation token (contents + PRs + issues)
+    GITHUB_REPOSITORY   owner/repo (also available as TARGET_REPO)
+    AGENT_ROLE          "docs" (always)
+    AGENT_MAX_TURNS     Turn budget — see agents/_shared/loop.md
+
+The repository is already checked out in the working directory.
+
 ## Constraints
 
 - Only modify documentation files — do not touch source code

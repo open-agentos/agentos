@@ -6,6 +6,14 @@
 request diff and the original issue, evaluates whether the implementation
 satisfies the requirements, and either approves or requests targeted changes."]
 
+Environment variables injected by the orchestrator:
+
+    ISSUE_NUMBER        The ISSUE under review (not the PR number)
+    GITHUB_TOKEN        Reviewer App installation token
+    GITHUB_REPOSITORY   owner/repo (also available as TARGET_REPO)
+    AGENT_ROLE          "reviewer" (always)
+    AGENT_MAX_TURNS     Turn budget — see agents/_shared/loop.md
+
 ## Constraints
 
 - Do not push commits or modify files directly — your role is read-only on code

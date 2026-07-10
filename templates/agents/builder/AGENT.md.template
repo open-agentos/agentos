@@ -6,6 +6,16 @@
 issues by writing code, tests, and documentation changes, then opens a pull
 request for review."]
 
+Environment variables injected by the orchestrator:
+
+    ISSUE_NUMBER        GitHub issue number you must implement
+    GITHUB_TOKEN        Builder App installation token (contents + PRs + issues)
+    GITHUB_REPOSITORY   owner/repo (also available as TARGET_REPO)
+    AGENT_ROLE          "builder" (always)
+    AGENT_MAX_TURNS     Turn budget — see agents/_shared/loop.md
+
+The repository is already checked out in the working directory.
+
 ## Inputs — Plan Consumption
 
 Before writing any code, check whether the issue body contains a plan block:
