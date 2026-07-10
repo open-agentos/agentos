@@ -14,7 +14,9 @@ Environment variables injected by the orchestrator:
     AGENT_ROLE          "builder" (always)
     AGENT_MAX_TURNS     Turn budget — see agents/_shared/loop.md
 
-The repository is already checked out in the working directory.
+The repository is already checked out in the working directory. Before pushing,
+run `gh auth setup-git` so commits use this agent's App identity — the checkout
+does not persist the default credentials.
 
 ## Inputs — Plan Consumption
 
