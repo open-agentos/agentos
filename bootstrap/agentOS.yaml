@@ -3,7 +3,7 @@
 # Human-readable, git-diffable, versioned.
 #
 # Import this file into your project with:
-#   agentOS init --from github:open-agentos/agentos@v1.2.3
+#   agentOS init --from github:open-agentos/agentos@v1.2.4
 #
 # Then provision your repository with:
 #   agentOS apply --repo owner/my-repo
