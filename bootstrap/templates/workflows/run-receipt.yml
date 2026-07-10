@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     # Only run when the triggering branch follows the agent/* naming convention
     if: startsWith(github.ref_name, 'agent/')
+    permissions:
+      issues: write
 
     steps:
       - name: Checkout repository

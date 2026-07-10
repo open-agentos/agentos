@@ -43,6 +43,9 @@ jobs:
        (startsWith(github.event.comment.body, '/approve-plan') ||
         startsWith(github.event.comment.body, '/request-changes')))
 
+    permissions:
+      issues: write
+
     env:
       LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
       LLM_MODEL: ${{ vars.LLM_MODEL }}
