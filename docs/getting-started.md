@@ -33,15 +33,18 @@ cp -r path/to/cloned/agentos/scripts ./scripts
 # 6. Provision labels, board, and workflows
 agentOS apply --repo my-org/my-agent-repo
 
-# 7. Copy prompt template to activate the builder role
+# 7. Add your credentials as GitHub Actions secrets (see below — apply does NOT do this for you)
+#    From .env: BUILDER_APP_ID, BUILDER_PRIVATE_KEY, and your LLM key (ANTHROPIC_API_KEY or LLM_API_KEY)
+
+# 8. Copy prompt template to activate the builder role
 cp agents/builder/AGENT.md.template agents/builder/AGENT.md
 
-# 8. Commit and push the generated files manually
+# 9. Commit and push the generated files manually
 git add .github/ workflows/ agents/ AGENTS.md agentOS.yaml config.yaml.example scripts/
 git commit -m "chore: provision agentOS core scaffolding, scripts, and agent prompts"
 git push origin main
 
-# 9. Confirm everything is wired up
+# 10. Confirm everything is wired up
 agentOS verify --repo my-org/my-agent-repo
 ```
 
@@ -84,13 +87,15 @@ export GITHUB_TOKEN=$(gh auth token)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-**An LLM provider key.** Export one now; `apply` stores it as a repo secret.
+**An LLM provider key.** Export one now; you'll add it as a repo secret in [step 4](#4-add-your-secrets) below.
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...      # or OPENAI_API_KEY, or OPENROUTER_API_KEY
 ```
 
-You'll also need a repo to provision — an existing one where you have admin access, or a new one:
+`LLM_API_KEY` also works as a provider-agnostic alternative — the runner accepts it directly and falls back to `ANTHROPIC_API_KEY` if it's unset.
+
+You'll also need a repo to provision — an existing one where you have admin access, or a new one. If you're pointing agentOS at an existing repo, it's worth trying the flow on a low-stakes or sample repo first to get a feel for it before running it against something you can't easily revert:
 
 ```bash
 gh repo create my-org/my-agent-repo --private --clone
@@ -133,7 +138,7 @@ The CLI opens GitHub's App-creation page with the fields pre-filled. For each Ap
 3. Click **Generate a private key** — this downloads a `.pem`. (Skipping it means regenerating the key by hand later.)
 4. Return to the terminal and press **Enter**.
 
-The CLI reads the `.pem` from your Downloads folder, moves it into `.agentOS/keys/`, and records the App ID. The key stays on your machine until `apply` uploads it as an encrypted Actions secret.
+The CLI reads the `.pem` from your Downloads folder, moves it into `.agentOS/keys/`, and records the App ID in `.env`. The key stays on your machine — you'll copy it to GitHub as a repo secret in [step 4](#4-add-your-secrets) below.
 
 ### 3. Provision
 
@@ -157,7 +162,7 @@ agentOS apply --repo my-org/my-agent-repo
 
 - **Labels** — upserts the label model. Creates what's missing, fixes changed colours, never deletes labels it didn't create.
 - **Board** — creates the Projects v2 board and writes its ID into `agentOS.yaml`.
-- **Workflows** — writes the orchestrator and builder workflows, and uploads the App credentials and LLM key as Actions secrets.
+- **Workflows** — writes the orchestrator and builder workflows to `.github/workflows/`. These reference your secrets by name but `apply` does not upload them — that's a manual step, next.
 - **Scaffold** — drops in editable prompt template files for the builder role (e.g., `agents/builder/AGENT.md.template`).
 
 > [!NOTE]
@@ -174,7 +179,21 @@ git commit -m "chore: provision agentOS core scaffolding"
 git push origin main
 ```
 
-### 4. Verify
+### 4. Add your secrets
+
+`agentOS setup` wrote your builder App's credentials to a local `.env` file — but that file never leaves your machine, and `apply` doesn't upload it. GitHub Actions can only read secrets added through the repo itself, so copy each value across by hand:
+
+1. Open `.env` and find `BUILDER_APP_ID` and `BUILDER_PRIVATE_KEY`.
+2. On GitHub, go to your repo's **Settings → Secrets and variables → Actions**, click **New repository secret**, and add each one (same name, same value).
+3. Add one more: your LLM key, as `ANTHROPIC_API_KEY` (or `LLM_API_KEY`).
+
+Full steps if you need them: [Creating secrets for a repository](https://docs.github.com/en/actions/security-guides/using-secrets-in-github-actions#creating-secrets-for-a-repository).
+
+Skipping this step is the most common reason a first run fails silently — the workflow dispatches but the runner has no credentials. Do this before moving on.
+
+Repeat it for every additional role App you create later (`agentOS setup --role reviewer`, etc.) — each writes its own `{ROLE}_APP_ID` / `{ROLE}_PRIVATE_KEY` pair to `.env` that needs the same manual copy.
+
+### 5. Verify
 
 ```bash
 agentOS verify --repo my-org/my-agent-repo
@@ -183,19 +202,24 @@ agentOS verify --repo my-org/my-agent-repo
 A passing run:
 
 ```
-[PASS] Labels       all required labels present
-[PASS] Board        "Agent Board" found, fields verified
-[PASS] Workflows    orchestrator + builder present on default branch
-[PASS] Secrets      builder credentials + LLM key set
-[PASS] Apps         builder installed
-[PASS] Config       board_id set, runner configured
+Verify report:
+  ✓ labels:present                    all 31 present
+  ✓ labels:colors                     all colors match
+  ✓ workflow:agent-orchestrator.yml   present
+  ✓ workflow:agent-settlement.yml     present
+  ✓ workflow:detect-run-failure.yml   present
+  ✓ workflow:run-receipt.yml          present
+  ✓ board:board_id                    PVT_kwHOB4example123
+  ✓ board:fields                      9/9 fields bound
+  ✓ board:live                        board resolves in GitHub
+  ✓ no-app-role:archaeologist         no App found for no-App role 'archaeologist' (correct)
 
-Ready.
+  PASS — 10/10 checks passed
 ```
 
-A `[FAIL]` line names what's missing and the command that fixes it. See [Troubleshooting](./troubleshooting.md) if you hit one.
+A `✗` line names the specific check that failed (e.g. `workflow:agent-orchestrator.yml — MISSING`) — the check name tells you what to fix. If everything else passes but the run itself fails, the most common cause is the secrets step above.
 
-### 5. Run it
+### 6. Run it
 
 The orchestrator fires when an issue has both a `type:*` label and `status:todo`.
 
@@ -216,11 +240,20 @@ gh run watch --repo my-org/my-agent-repo
 
 The orchestrator reads the issue, moves it to `status:in-progress`, and dispatches the builder. The builder branches, runs the configured agent, commits, opens a PR, and sets `status:in-review`.
 
-You end with a PR on `agent/issue-<N>-<slug>`, and a receipt posted to the issue:
+You end with a PR on `agent/issue-<N>-<slug>`, and a receipt posted as a comment on the issue:
 
 ```
-Run Receipt | Role: builder | Status: clean | Duration: 73s
-Branch: agent/issue-42-add-hello-world-endpoint
+### Agent run record (provisional)
+
+- **✅ run exited cleanly** — clean-exit: `clean`
+- role: `builder` · kind: `issue` · #42
+- turns: **6** · tool calls: **14**
+- friction — errors: 0 · retries: 0 · repeats: 0
+- tokens — in: 18420 · out: 2103 · total: **20523**
+- cost — $0.087210 (18420 in · 2103 out)
+- duration: 73s · [View run](https://github.com/my-org/my-agent-repo/actions/runs/123456789)
+
+_Outcome is `provisional` until the PR is settled (merge / CI / review)._
 ```
 
 That receipt is the first entry in the run record — the per-run accounting of cost, turns, outcome, exit status, and token counts.
@@ -254,6 +287,8 @@ agentOS apply --repo my-org/my-agent-repo
 > [!NOTE]
 > Ensure you copy or rename the respective prompt templates (`AGENT.md.template`) to `AGENT.md` for any new active roles (like `reviewer` or `watcher`) that you wish to customize and enable.
 
+Each new role adds its own `{ROLE}_APP_ID` / `{ROLE}_PRIVATE_KEY` pair to `.env` — copy them to GitHub Actions secrets the same way as in [Add your secrets](#4-add-your-secrets).
+
 `status:in-review` then triggers a review, merges settle on their own, and every run lands in the corpus. [Agent Roles](./agent-roles.md) covers what each identity can and can't do.
 
 ### Customise the framework
@@ -280,6 +315,5 @@ Every run appends to a structured corpus — cost, turns, outcome, exit status. 
 
 - [Agent Roles](./agent-roles.md) — what each App can do, and the runner interface
 - [Label Model](./label-model.md) — the state machine behind the labels
-- [Troubleshooting](./troubleshooting.md) — fixes for the common failures
 - [Specification](../SPEC.md) — the normative reference
 - [Uninstall](./uninstall.md) — how to remove agentOS from a repo
