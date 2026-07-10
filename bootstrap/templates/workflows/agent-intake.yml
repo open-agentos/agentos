@@ -671,7 +671,7 @@ jobs:
           ISSUE_NUMBER: ${{ needs.classify.outputs.stub_number }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           DIFF_LINES: ${{ steps.facts.outputs.diff_lines }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY || secrets.ANTHROPIC_API_KEY }}
           # NOTE: GITHUB_TOKEN intentionally absent (SPEC.md §12.6.1).
         run: |
           if [ "$DIFF_LINES" -gt "$INTAKE_MAX_DIFF_LINES" ]; then
