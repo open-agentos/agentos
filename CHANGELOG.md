@@ -10,6 +10,37 @@ version. Each major bump ships a corresponding MIGRATION-vN.md in the repo root.
 
 ---
 
+## [1.2.4] — 2026-07-10
+
+Patch release. Adds an operator cost control to the intake pipeline.
+`specVersion` stays `"1.2"` (no wire-format or label changes).
+
+### Added
+
+- **Trusted-author gate for intake (§12.2.7)** — the archaeologist is
+  LLM-backed and runs on every wild PR, so an untrusted contributor could
+  previously cause model spend simply by opening a PR. The classifier now
+  evaluates a trust gate **before** the §12.2.2 syntactic classification: intake
+  proceeds only when the PR author's repo collaborator permission is at/above
+  `intake.min_permission` (new; default `write`) or the author's login appears
+  in `intake.allow_actors` (new; default empty). Untrusted authors' PRs are left
+  entirely untouched — no stub, no janitors, no archaeology, zero LLM spend —
+  for a maintainer to triage by hand. The gate **fails closed**: an unset or
+  invalid `min_permission`, or an unresolvable author permission, is treated as
+  untrusted, so a misconfiguration can only suppress spend, never enable it.
+  Overridable at runtime via repository variables `INTAKE_MIN_PERMISSION` and
+  `INTAKE_ALLOW_ACTORS` without editing the workflow.
+
+  Operators wanting the pre-1.2.4 "trust everyone" behaviour can set
+  `INTAKE_MIN_PERMISSION=read` (or lower).
+
+  Touches: `templates/workflows/agent-intake.yml` (classify step + env),
+  `agentOS.yaml` (`intake.min_permission`, `intake.allow_actors`),
+  `schema/agentOS.schema.json`, `SPEC.md` §12.2.7 + conformance checklist,
+  `docs/intake.md`, and the byte-identical `bootstrap/` mirrors. New tests in
+  `tests/test_intake.py` guard the defaults, the gate's presence in the
+  classifier, and its fail-closed behaviour.
+
 ## [1.2.3] — 2026-07-08
 
 Patch release. Fixes and hardening across the intake pipeline, all proven

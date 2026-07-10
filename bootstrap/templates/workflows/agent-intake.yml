@@ -47,6 +47,21 @@ env:
   INTAKE_TRIPWIRE_PATHS: ${{ vars.INTAKE_TRIPWIRE_PATHS || '.github/workflows/**,.github/actions/**,agentOS.yaml,.agentOS/**' }}
   GOVERNANCE_APPROVERS: ${{ vars.GOVERNANCE_APPROVERS || 'admin' }}
 
+  # Trusted-author gate (operator cost policy — SPEC.md §12.2.7). The
+  # archaeologist is LLM-backed and runs on every wild PR, so this gate refuses
+  # to admit a PR into the intake pipeline unless its author is trusted: either
+  # the login is in INTAKE_ALLOW_ACTORS, or the author's repo collaborator
+  # permission is at/above INTAKE_MIN_PERMISSION. Untrusted authors' PRs are
+  # left untouched (no stub, no janitors, no archaeology, zero LLM spend) for a
+  # maintainer to triage by hand. This is a policy gate applied BEFORE the
+  # §12.2.2 syntactic classification, not a classification heuristic — it never
+  # changes what "wild" means, only whether the pipeline runs at all.
+  # Tiers, low→high: none < read < triage < write < maintain < admin.
+  # Fails CLOSED: an unset/invalid threshold or an unresolvable author is
+  # treated as untrusted, so a misconfig can never open the spend floodgate.
+  INTAKE_MIN_PERMISSION: ${{ vars.INTAKE_MIN_PERMISSION || 'write' }}
+  INTAKE_ALLOW_ACTORS: ${{ vars.INTAKE_ALLOW_ACTORS || '' }}
+
 jobs:
 
   # ---------------------------------------------------------------------------
@@ -188,6 +203,53 @@ jobs:
               await core.summary.write();
               return;
             }
+
+            // Trusted-author gate (operator cost policy — SPEC.md §12.2.7).
+            // Runs BEFORE the §12.2.2 syntactic classification. It does not
+            // reclassify: it decides whether the (LLM-backed) intake pipeline
+            // runs at all. Untrusted authors' PRs are left untouched — no stub,
+            // no janitors, no archaeology, zero LLM spend.
+            const ALLOW_ACTORS = (process.env.INTAKE_ALLOW_ACTORS || '')
+              .split(',').map(s => s.trim()).filter(Boolean);
+            const MIN_PERMISSION = (process.env.INTAKE_MIN_PERMISSION || 'write').trim();
+            // Ordered low→high; index comparison decides "at or above".
+            const PERM_RANK = ['none', 'read', 'triage', 'write', 'maintain', 'admin'];
+
+            if (!ALLOW_ACTORS.includes(author)) {
+              const minIdx = PERM_RANK.indexOf(MIN_PERMISSION);
+              if (minIdx < 0) {
+                // Misconfigured threshold: fail CLOSED (treat as untrusted) so a
+                // typo can never open the LLM spend floodgate.
+                console.log(`INTAKE_MIN_PERMISSION='${MIN_PERMISSION}' is not a valid permission tier — failing closed, treating '${author}' as untrusted.`);
+                core.summary.addRaw(`## Classify verdict\n\n**untrusted** — \`INTAKE_MIN_PERMISSION\` value \`${MIN_PERMISSION}\` is invalid; failing closed. Fix the variable to one of: none, read, triage, write, maintain, admin.\n`);
+                await core.summary.write();
+                return;
+              }
+              let permission = 'none';
+              try {
+                const { data: perm } = await github.rest.repos.getCollaboratorPermissionLevel(
+                  { owner, repo, username: author });
+                permission = perm.permission || 'none';
+                // GitHub returns 'admin'|'write'|'read'|'none' via this REST
+                // field; 'maintain'/'triage' surface as 'write'/'read' and still
+                // rank correctly for the at-or-above comparison.
+              } catch (e) {
+                // 404 = not a collaborator → 'none'. Any other error also fails
+                // closed (no spend on ambiguity).
+                console.log(`Could not resolve permission for '${author}' (${e.status || 'error'}) — treating as untrusted.`);
+                permission = 'none';
+              }
+              if (PERM_RANK.indexOf(permission) < minIdx) {
+                console.log(`Author '${author}' permission '${permission}' below the '${MIN_PERMISSION}' intake threshold and not in INTAKE_ALLOW_ACTORS — leaving PR untouched (no LLM spend).`);
+                core.summary.addRaw(`## Classify verdict\n\n**untrusted** — author \`${author}\` (permission \`${permission}\`) is below the \`${MIN_PERMISSION}\` intake threshold and not in \`INTAKE_ALLOW_ACTORS\`. No stub, no archaeology, no LLM spend.\n\nA maintainer can admit this PR by applying \`status:todo\` by hand, or by adding \`${author}\` to \`INTAKE_ALLOW_ACTORS\`.\n`);
+                await core.summary.write();
+                return;
+              }
+              console.log(`Author '${author}' permission '${permission}' meets the '${MIN_PERMISSION}' threshold — proceeding with intake.`);
+            } else {
+              console.log(`Author '${author}' is in INTAKE_ALLOW_ACTORS — proceeding with intake.`);
+            }
+
             // Rule 2: author is not excluded.
             if (EXCLUDE_ACTORS.includes(author)) {
               console.log(`Author '${author}' is in exclude_actors — intake ignores this PR.`);

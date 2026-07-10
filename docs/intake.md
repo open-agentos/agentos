@@ -91,6 +91,13 @@ security property is intent-before-code, and intake structurally lacks it.
 So intake doesn't pretend parity; it builds a visibly second-class trust
 tier:
 
+- **Untrusted authors cost nothing.** The archaeologist is LLM-backed and
+  runs on every wild PR, so a trusted-author gate runs *before* classification:
+  intake only proceeds for authors at/above `INTAKE_MIN_PERMISSION` (default
+  `write`) or listed in `INTAKE_ALLOW_ACTORS`. A random contributor's PR is left
+  untouched — no stub, no janitors, no archaeology, zero LLM spend — for a
+  maintainer to triage by hand. The gate fails closed: a misconfig can only
+  suppress spend, never enable it.
 - **Tripwires run before any agent.** A wild diff touching
   `.github/workflows/**`, `agentOS.yaml`, or other protected paths goes
   straight to `status:blocked`. No reconstruction, no autofix, human eyes
@@ -115,6 +122,8 @@ Repository variables (override without editing workflows):
 
     INTAKE_ENABLED            true (default)
     INTAKE_EXCLUDE_ACTORS     dependabot[bot],renovate[bot]
+    INTAKE_MIN_PERMISSION     write — min collaborator permission an author needs for intake to run
+    INTAKE_ALLOW_ACTORS       (empty) — logins always trusted regardless of permission
     INTAKE_SETTLE_SECONDS     300 — quiet period before the archaeologist runs
     INTAKE_MAX_DIFF_LINES     6000 — above this: facts-only, a human reads the diff
     INTAKE_APPROVE_INTENT_SELF true — may the author approve their own intent
