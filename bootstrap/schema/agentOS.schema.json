@@ -207,6 +207,18 @@
           "items": { "type": "string" },
           "default": ["dependabot[bot]", "renovate[bot]"]
         },
+        "min_permission": {
+          "type": "string",
+          "enum": ["none", "read", "triage", "write", "maintain", "admin"],
+          "default": "write",
+          "description": "Trusted-author gate (SPEC.md §12.2.7). Intake runs only for authors whose repo collaborator permission is at/above this tier, or who appear in allow_actors. Untrusted authors' PRs are left untouched (no stub, no LLM spend). Fails closed on misconfiguration."
+        },
+        "allow_actors": {
+          "type": "array",
+          "description": "Logins always trusted by the intake gate regardless of their collaborator permission tier (SPEC.md §12.2.7).",
+          "items": { "type": "string" },
+          "default": []
+        },
         "linked_prs": {
           "type": "string",
           "enum": ["ignore", "janitors-report-only"],

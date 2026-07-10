@@ -835,6 +835,9 @@ intake-conformant if additionally:
     pushes never reset intake state
   - `pull_request_target` is never combined with a checkout of contributed code
     anywhere in the intake pipeline (§12.2.6)
+  - The trusted-author gate (§12.2.7) is evaluated before classification and
+    fails closed: untrusted-author PRs cause no stub, no janitors, no
+    archaeologist run, and no LLM spend
   - The archaeologist runs tokenless with orchestrator-mediated writes (§12.6)
   - Janitor and archaeologist invocations produce valid run records with
     identity.role = "janitor" / "archaeologist" (§12.10)
@@ -952,6 +955,50 @@ an internal wild PR, at a stricter trust setting.
 
 Implementations MUST NOT use `pull_request_target` with a checkout of the
 contributed code anywhere in the intake pipeline.
+
+#### 12.2.7 Trusted-author gate (operator cost policy)
+
+The archaeologist (§12.6) is LLM-backed and runs on every wild PR. On a public
+repository this means an unbounded population of contributors can each cause
+model spend simply by opening a PR. Implementations MUST provide a trusted-author
+gate that bounds this exposure.
+
+The gate is evaluated in the classifier, **before** the §12.2.2 syntactic rule,
+and is distinct from it. It is not a classification heuristic and MUST NOT change
+what "wild" means (§12.2.2's predictability guarantee is preserved): it decides
+only whether the intake pipeline runs at all for a given author.
+
+An author is **trusted** if either:
+
+1. Their login appears in `intake.allow_actors`, or
+2. Their repository collaborator permission is at or above
+   `intake.min_permission`, using the total order
+   `none < read < triage < write < maintain < admin`.
+
+When the author is **not** trusted, the classifier MUST leave the PR entirely
+untouched: no stub issue, no janitors, no archaeologist invocation, and
+therefore no LLM spend. Such a PR remains an ordinary GitHub pull request that a
+maintainer triages by hand; a maintainer admits it to the agent lane explicitly
+(for example by applying `status:todo`, or by adding the author to
+`intake.allow_actors`).
+
+Defaults and failure behaviour (normative):
+
+- `intake.min_permission` defaults to `write`. `intake.allow_actors` defaults to
+  empty.
+- The gate MUST **fail closed**. If `min_permission` is unset or not a member of
+  the permission order, or if the author's permission cannot be resolved (for
+  example a non-collaborator returns 404, or the permission API errors), the
+  author MUST be treated as untrusted. A misconfiguration can therefore only
+  suppress spend, never enable it.
+- Operators MAY relax the gate toward the pre-1.2.4 "trust everyone" behaviour by
+  setting `min_permission: read` (or lower), accepting the corresponding spend
+  exposure.
+
+Interaction with forks (§12.2.5): the gate is orthogonal to hardened mode. A fork
+PR from a trusted author still enters intake in hardened mode; a fork PR from an
+untrusted author is left untouched by the gate before hardened mode is ever
+considered.
 
 ### 12.3 Label model additions
 

@@ -12,6 +12,7 @@ Covers:
   - the intake workflow template's security invariants:
       * recursion guard present (§12.2.4 — normative, MUST be tested)
       * never uses pull_request_target (§12.2.6)
+      * trusted-author cost gate present and fails closed (§12.2.7)
       * archaeologist step receives no GitHub token
 """
 
@@ -61,6 +62,19 @@ def test_intake_block_present_with_normative_defaults(spec):
     assert intake["max_recon_runs"] == 5
     assert intake["model"] is None
     assert intake["approve_intent_self"] is True
+
+
+def test_intake_trusted_author_gate_defaults(spec):
+    """§12.2.7: the trusted-author cost gate must default to write + empty allow."""
+    intake = spec["intake"]
+    assert intake["min_permission"] == "write", (
+        "Default intake.min_permission must be 'write' — the gate that stops "
+        "untrusted-author PRs from spending LLM tokens (§12.2.7)."
+    )
+    assert intake["allow_actors"] == [], (
+        "Default intake.allow_actors must be empty; operators opt specific "
+        "logins in explicitly."
+    )
 
 
 def test_intake_tripwire_defaults(spec):
@@ -242,6 +256,34 @@ def test_archaeologist_step_receives_no_github_token(intake_workflow_text):
     assert "GITHUB_TOKEN" not in env, (
         "The archaeologist is a pure function and holds no GitHub token (§12.6.1)."
     )
+
+
+def test_trusted_author_gate_present_in_classifier(intake_workflow_text):
+    """§12.2.7: the classifier must gate on author trust BEFORE running the
+    LLM-backed archaeologist. Guards against silent removal of the cost control."""
+    # Config variables are declared with sensible defaults.
+    assert "INTAKE_MIN_PERMISSION" in intake_workflow_text
+    assert "INTAKE_ALLOW_ACTORS" in intake_workflow_text
+    assert "vars.INTAKE_MIN_PERMISSION || 'write'" in intake_workflow_text
+    # The permission-tier comparison is implemented.
+    assert "getCollaboratorPermissionLevel" in intake_workflow_text
+    assert "PERM_RANK" in intake_workflow_text
+    # The gate runs in the classify job (before wild=true is emitted and long
+    # before the archaeologist job, which is gated on classify's wild output).
+    doc = yaml.safe_load(intake_workflow_text)
+    assert doc["jobs"]["archaeologist"]["needs"] == ["classify", "janitors"] or \
+        "classify" in doc["jobs"]["archaeologist"]["needs"], (
+        "archaeologist must depend on classify so the gate can suppress it."
+    )
+
+
+def test_trusted_author_gate_fails_closed(intake_workflow_text):
+    """§12.2.7: an invalid threshold or unresolvable author must be treated as
+    untrusted (fail closed) — a misconfig can only suppress spend, never enable it."""
+    # Invalid min_permission → early return (minIdx < 0 branch).
+    assert "minIdx < 0" in intake_workflow_text
+    # Lookup failure defaults permission to 'none' (the lowest tier).
+    assert "permission = 'none'" in intake_workflow_text
 
 
 def test_intake_workflow_mirrors_synced():

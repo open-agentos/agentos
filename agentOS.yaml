@@ -217,6 +217,22 @@ intake:
   # PR authors ignored by intake entirely (bot flood guard, SPEC.md §12.2.2).
   exclude_actors: ["dependabot[bot]", "renovate[bot]"]
 
+  # Trusted-author gate (operator cost policy, SPEC.md §12.2.7). Because intake
+  # runs the LLM-backed archaeologist on every wild PR, the pipeline only runs
+  # for a trusted author: one whose repo collaborator permission is at/above
+  # min_permission, or whose login appears in allow_actors. Untrusted authors'
+  # PRs are left untouched — no stub, no janitors, no archaeology, zero LLM
+  # spend — for a maintainer to triage by hand (apply status:todo to opt in).
+  # This gate runs BEFORE the §12.2.2 syntactic rule; it never changes what
+  # "wild" means, only whether the pipeline runs at all.
+  # Tiers, low→high: none < read < triage < write < maintain < admin.
+  # Fails CLOSED: an unset/invalid min_permission or an unresolvable author is
+  # treated as untrusted, so a misconfig can never open the spend floodgate.
+  # Override at runtime via repo Actions variables INTAKE_MIN_PERMISSION and
+  # INTAKE_ALLOW_ACTORS (comma-separated) without editing the workflow.
+  min_permission: write
+  allow_actors: []
+
   # Human PRs with a closing-linked issue are planned work done manually.
   # ignore                — intake does not touch them (default)
   # janitors-report-only  — run report-tier janitors (no pushes, no archaeology)
