@@ -388,6 +388,17 @@ jobs:
         if: env.AGENT_ROLE != 'skip'
         run: npm install -g @anthropic-ai/claude-code
 
+      - name: Preflight — verify an LLM API key is configured
+        if: env.AGENT_ROLE != 'skip'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${LLM_API_KEY:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::No LLM API key configured. Set LLM_API_KEY (or ANTHROPIC_API_KEY) in repository secrets before running agents."
+            exit 1
+          fi
+
       # -----------------------------------------------------------------------
       # Run the agent ({{AGENT_RUNNER}} is replaced at install time)
       # For the planner role, a concurrency group (see top-level concurrency:)
@@ -468,6 +479,17 @@ jobs:
 
       - name: Install Claude CLI
         run: npm install -g @anthropic-ai/claude-code
+
+      - name: Preflight — verify an LLM API key is configured
+        if: env.AGENT_ROLE != 'skip'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${LLM_API_KEY:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::No LLM API key configured. Set LLM_API_KEY (or ANTHROPIC_API_KEY) in repository secrets before running agents."
+            exit 1
+          fi
 
       - name: Run planner agent
         run: '{{AGENT_RUNNER}}'
