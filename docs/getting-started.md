@@ -40,7 +40,7 @@ agentOS apply --repo my-org/my-agent-repo
 cp agents/builder/AGENT.md.template agents/builder/AGENT.md
 
 # 9. Commit and push the generated files manually
-git add .github/ workflows/ agents/ AGENTS.md agentOS.yaml config.yaml.example scripts/
+git add .github/ workflows/ agents/ AGENTS.md agentOS.yaml config.yaml.example field-bindings.json scripts/
 git commit -m "chore: provision agentOS core scaffolding, scripts, and agent prompts"
 git push origin main
 
@@ -174,7 +174,7 @@ Review the diff and commit the new files manually:
 # Copy/rename the template prompt file to activate the builder role
 cp agents/builder/AGENT.md.template agents/builder/AGENT.md
 
-git add .github/ workflows/ agents/ AGENTS.md agentOS.yaml config.yaml.example scripts/
+git add .github/ .agentOS/ .gitignore workflows/ agents/ ops-metrics/ AGENTS.md agentOS.yaml config.yaml.example scripts/
 git commit -m "chore: provision agentOS core scaffolding"
 git push origin main
 ```
