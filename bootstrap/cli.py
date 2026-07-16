@@ -207,6 +207,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     gitignore = Path(".gitignore")
     gitignore_entries = [
         "# agentOS — local secrets and runtime state",
+        ".env",
         ".agentOS/keys/",
         ".agentOS/logs/",
         ".agentOS-state.json",
